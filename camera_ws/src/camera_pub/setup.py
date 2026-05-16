@@ -25,6 +25,7 @@ setup(
             'image_viewer = camera_pub.image_viewer:main',
             'serial_bypassing = camera_pub.serial_bypassing:main',
             'serial_bypass_test = camera_pub.serial_bypass_test:main',
+            'ui_controller = camera_pub.ui_controller:main',
         ],
     },
 )

@@ -1,0 +1,2 @@
+{"x": 216, "y": 1299, "width": 700, "height": 215}
+{"SendStr": "", "TiltAngle": "23", "PanningAngle": "0", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "90"}
