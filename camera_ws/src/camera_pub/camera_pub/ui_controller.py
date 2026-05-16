@@ -94,42 +94,49 @@ class Window(QWidget, UIBase):
 
     def SetTilt(self):
         angle = int(min(self.get_ui_val("TiltAngle", float) / 90 * 1000, 1000))
-        self._send(f"SV -1 {angle}")
+        self.set_ui_val("SendStr", f"SV -1 {angle}")
+        self.SendStr()
 
     def SetPanning(self):
         pan = 1500.0 - self.get_ui_val("PanningAngle", float) / 135.0 * 1000.0
-        self._send(f"SV 1 {int(pan)}")
+        self.set_ui_val("SendStr", f"SV 1 {int(pan)}")
+        self.SendStr()
 
     def MotCancel(self):
-        self._send("EN -1 1")
+        self.set_ui_val("SendStr", "EN -1 1")
+        self.SendStr()
 
     def MoveFoward(self):
         self.MotCancel()
         time.sleep(0.25)
         spd  = self.getUIVal("MVSpd")[0]
         dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
-        self._send(f"MV 1 {spd} -{dist}")
+        self.set_ui_val("SendStr", f"MV 1 {spd} -{dist}")
+        self.SendStr()
 
     def MoveBackward(self):
         self.MotCancel()
         time.sleep(0.25)
         spd  = self.getUIVal("MVSpd")[0]
         dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
-        self._send(f"MV 1 {spd} {dist}")
+        self.set_ui_val("SendStr", f"MV 1 {spd} {dist}")
+        self.SendStr()
 
     def RotateLeft(self):
         self.MotCancel()
         time.sleep(0.25)
         spd  = self.getUIVal("RotSpd")[0]
         dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)
-        self._send(f"RT 1 {spd} -{dist}")
+        self.set_ui_val("SendStr", f"RT 1 {spd} -{dist}")
+        self.SendStr()
 
     def RotateRight(self):
         self.MotCancel()
         time.sleep(0.25)
         spd  = self.getUIVal("RotSpd")[0]
         dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)
-        self._send(f"RT 1 {spd} {dist}")
+        self.set_ui_val("SendStr", f"RT 1 {spd} {dist}")
+        self.SendStr()
 
 
 def main(args=None):
