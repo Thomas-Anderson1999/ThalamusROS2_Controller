@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import QTimer
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
+from std_msgs.msg import String
 from serial_interfaces.srv import SerialBypass
 
 
@@ -20,6 +21,10 @@ class UIControllerNode(Node):
     def __init__(self):
         super().__init__('ui_controller')
         self.cli = self.create_client(SerialBypass, 'serial_bypass')
+        self.create_subscription(String, 'serial_message', self._on_serial_msg, 10)
+
+    def _on_serial_msg(self, msg):
+        print(f'[serial] {msg.data}')
 
     def send_serial(self, raw_str):
         if not self.cli.service_is_ready():
