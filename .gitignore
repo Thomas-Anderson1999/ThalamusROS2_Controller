@@ -1,0 +1,8 @@
+build
+data
+log
+install
+venv
+camera_ws/build
+camera_ws/log
+camera_ws/install
