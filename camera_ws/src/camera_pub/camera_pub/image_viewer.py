@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CompressedImage, Image
+from geometry_msgs.msg import Vector3
 from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
@@ -28,7 +29,13 @@ class SyncViewer(Node):
 
         self.sync.registerCallback(self.callback)
 
+        self.create_subscription(Vector3, 'camera_attitude', self._on_attitude, 10)
+        self._attitude = None
+
         self.get_logger().info("Sync viewer started")
+
+    def _on_attitude(self, msg):
+        self._attitude = msg
 
     def normalize_depth(self, depth):
         d = depth.copy()
@@ -60,6 +67,13 @@ class SyncViewer(Node):
         depth8 = self.normalize_depth(depth)
         color = cv2.applyColorMap(depth8, cv2.COLORMAP_TURBO)
         cv2.imshow("recv_depth", color)
+
+        d = depth[128, 128]
+        if self._attitude is not None:
+            a = self._attitude
+            print(f'[depth@128,128] {d:.3f} m  roll={a.x:.1f}  pitch={a.y:.1f}  yaw={a.z:.1f}')
+        else:
+            print(f'[depth@128,128] {d:.3f} m')
 
 
 def main(args=None):
