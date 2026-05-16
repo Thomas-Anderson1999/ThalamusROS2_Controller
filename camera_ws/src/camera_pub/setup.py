@@ -23,6 +23,8 @@ setup(
             'record_node = camera_pub.record_node:main',
             'camera_node_d455i = camera_pub.camera_node_d455i:main',
             'image_viewer = camera_pub.image_viewer:main',
+            'serial_bypassing = camera_pub.serial_bypassing:main',
+            'serial_bypass_test = camera_pub.serial_bypass_test:main',
         ],
     },
 )
