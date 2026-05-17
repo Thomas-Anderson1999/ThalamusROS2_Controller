@@ -12,6 +12,7 @@ from PyQt5.QtCore import QTimer
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from camera_pub.ui_utils import StreamingWindow
+from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import CompressedImage, Image
@@ -20,6 +21,28 @@ from serial_interfaces.srv import SerialBypass
 
 meter_per_enc = 11600
 rotate_pi_per_enc = 4819
+
+_ASM_FILE = "ScriptFreeModel.txt".encode("UTF-8")
+_thalamus_ready = False
+
+def _init_thalamus():
+    global _thalamus_ready
+    if _thalamus_ready:
+        return True
+    if LoadThalamusInterface():
+        InitEngine(_ASM_FILE, 1280, 720, 0)
+        _thalamus_ready = True
+        print("[thalamus] InitEngine OK")
+        return True
+    print("[thalamus] LoadThalamusInterface FAILED")
+    return False
+
+def get_tilt_servo_angle(cam_angle):
+    _CAM_ANGLES   = np.array([20, 10, 0, -13, -27, -40, -54, -90], dtype=float)
+    _SERVO_ANGLES = np.array([ 0,  9, 19,  29,  39,  49,  59,  69], dtype=float)
+    cam_angle = np.clip(cam_angle, _CAM_ANGLES.min(), _CAM_ANGLES.max())
+    servo = np.interp(cam_angle, _CAM_ANGLES[::-1], _SERVO_ANGLES[::-1])
+    return int(np.clip(servo, 0, 90))
 
 
 class UIControllerNode(Node):
@@ -189,8 +212,48 @@ class Window(QWidget, UIBase):
     # ── streaming ──────────────────────────────────────────────
     def open_streaming(self):
         self._streaming_window = StreamingWindow()
+        self._streaming_window.set_click_cb(self._on_image_click)
+        self._streaming_window.set_dblclick_cb(self.set_clicked_pos)
         self._streaming_window.show()
         self._streaming = True
+
+    def _on_image_click(self, name, x, y):
+        self.set_ui_val("ClickPosX", str(x))
+        self.set_ui_val("ClickPosY", str(y))
+        print(f"[click] name={name} x={x} y={y}")
+
+        # ── TgtPan / TgtTilt 계산 ──────────────────────────────
+        rgb = self.ros_node.rgb_image
+        if rgb is None:
+            print("[click] rgb is None, skip")
+            return
+        img_h, img_w = rgb.shape[:2]
+        tx = int(1280 * x / img_w)
+        ty = int(720  * y / img_h)
+        print(f"[click] tx={tx} ty={ty}")
+
+        if not _init_thalamus():
+            print("[click] thalamus not ready")
+            return
+        try:
+            norm_vec = np.array(Pixelto3D(tx, ty, 1))
+            print(f"[click] norm_vec={norm_vec}")
+        except Exception as e:
+            print(f"[click] Pixelto3D error: {e}")
+            return
+
+        nx, ny, nz = tuple(norm_vec)
+
+        pan_angle  = np.degrees(np.arctan2(nx, nz))
+        tilt_deg   = np.degrees(np.arctan2(-ny, np.sqrt(nx*nx + nz*nz)))
+
+        current_tilt = self.get_ui_val("camera_pitch", float) or 0.0
+        tilt_servo   = get_tilt_servo_angle(current_tilt + tilt_deg)
+        pan_servo    = int(pan_angle - (self.get_ui_val("N", int) or 0))
+        print(f"[click] pan_servo={pan_servo} tilt_servo={tilt_servo}")
+
+        self.set_ui_val("TgtPan",  str(pan_servo))
+        self.set_ui_val("TgtTilt", str(tilt_servo))
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
@@ -297,6 +360,9 @@ class Window(QWidget, UIBase):
                 ty = np.asarray(self.odom_y)
                 ty_ = np.asarray(self.odom_yaw)
                 self.setUIVal("Trajectory", [tx, ty, ty_, len(tx) - 1])
+                self.set_ui_val("odometry_X",   f"{self.odom_x[-1]:.3f}")
+                self.set_ui_val("odometry_Y",   f"{self.odom_y[-1]:.3f}")
+                self.set_ui_val("odometry_Yaw", f"{self.odom_yaw[-1]:.3f}")
             else:
                 self.enc_val_reset()
 
@@ -366,6 +432,14 @@ class Window(QWidget, UIBase):
         time.sleep(0.2)
         self.SetPanning()
 
+    def set_clicked_pos(self):
+        self.set_ui_val("TiltAngle", self.get_ui_val("TgtTilt"))
+        self.SetTilt()
+        time.sleep(0.2)
+        pan = (self.get_ui_val("PanningAngle", float) or 0.0) + (self.get_ui_val("TgtPan", float) or 0.0)
+        self.set_ui_val("PanningAngle", str(int(pan)))
+        self.SetPanning()
+
     def quit_app(self):
         QApplication.quit()
 
@@ -384,7 +458,10 @@ class PresetCamWindow(QWidget, UIBase):
         pan_def  = [-127,  -82, -37,   8,  53,   98,   135 ]
 
         # ── pan angle header ───────────────────────────────────
-        ele_list = []
+        ele_list = [
+            UIElement(_type=UIElementType.BUTTON, _caption="Quit", _default_val=self.parent_window.quit_app),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
         for p, d in zip(pan, pan_def):
             ele_list.append(UIElement(_type=UIElementType.EDIT, _caption=p, _default_val=str(d)))
         ele_list.append(UIElement(_type=UIElementType.NEW_LINE))
@@ -407,12 +484,30 @@ class PresetCamWindow(QWidget, UIBase):
         self.ui_dic_list.append(dic)
         mainGrid.addWidget(subgrid, 0, 0)
 
+        # ── Auto-Control info ──────────────────────────────────
+        info_ele_list = [
+            UIElement(_type=UIElementType.EDIT,   _caption="ClickPosX",       _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ClickPosY",       _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="TgtPan",          _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="TgtTilt",         _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="set_clicked_pos", _default_val=self.parent_window.set_clicked_pos),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="odometry_X",      _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="odometry_Y",      _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="odometry_Yaw",    _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
+        subgrid2, dic2 = self.createGroupBox("Auto-Control", info_ele_list)
+        self.ui_dic_list.append(dic2)
+        mainGrid.addWidget(subgrid2, 1, 0)
+
         self.setLayout(mainGrid)
         self.setWindowTitle("Auto Control")
-        self.resize(1200, 200)
+        self.resize(1200, 300)
 
 
 def main(args=None):
+    _init_thalamus()
     rclpy.init(args=args)
     ros_node = UIControllerNode()
 

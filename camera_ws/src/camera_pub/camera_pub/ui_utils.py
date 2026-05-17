@@ -10,15 +10,21 @@ class ClickableLabel(QLabel):
     def __init__(self, name):
         super().__init__()
         self._name = name
+        self._click_cb = None
+        self._dblclick_cb = None
 
-    def mousePressEvent(self, event):
-        # map click position to image pixel coordinates
+    def set_click_cb(self, cb):
+        self._click_cb = cb
+
+    def set_dblclick_cb(self, cb):
+        self._dblclick_cb = cb
+
+    def _pixel_pos(self, event):
         pm = self.pixmap()
         if pm is None:
-            return
+            return None, None
         lw, lh = self.width(), self.height()
         iw, ih = pm.width(), pm.height()
-        # image is centered with KeepAspectRatio
         scale = min(lw / iw, lh / ih)
         ox = (lw - iw * scale) / 2
         oy = (lh - ih * scale) / 2
@@ -26,7 +32,23 @@ class ClickableLabel(QLabel):
         y = int((event.y() - oy) / scale)
         x = max(0, min(x, iw - 1))
         y = max(0, min(y, ih - 1))
+        return x, y
+
+    def mousePressEvent(self, event):
+        x, y = self._pixel_pos(event)
+        if x is None:
+            return
         print(f"[{self._name}] click x={x}, y={y}")
+        if self._click_cb:
+            self._click_cb(self._name, x, y)
+
+    def mouseDoubleClickEvent(self, event):
+        x, y = self._pixel_pos(event)
+        if x is None:
+            return
+        print(f"[{self._name}] double-click x={x}, y={y}")
+        if self._dblclick_cb:
+            self._dblclick_cb()
 
 
 class StreamingWindow(QWidget):
@@ -43,6 +65,14 @@ class StreamingWindow(QWidget):
             layout.addWidget(lbl)
         self.setLayout(layout)
         self.resize(1280, 480)
+
+    def set_click_cb(self, cb):
+        self.rgb_label.set_click_cb(cb)
+        self.depth_label.set_click_cb(cb)
+
+    def set_dblclick_cb(self, cb):
+        self.rgb_label.set_dblclick_cb(cb)
+        self.depth_label.set_dblclick_cb(cb)
 
     def update_rgb(self, img_bgr):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
