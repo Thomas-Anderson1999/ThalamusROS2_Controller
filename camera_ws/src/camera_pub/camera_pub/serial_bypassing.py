@@ -31,9 +31,11 @@ class SerialBypassingNode(Node):
 
     def callback(self, request, response):
         try:
-            self.ser.write(request.data.encode())
+            data = request.data.encode('ascii')
+            self.ser.write(data)
+            self.ser.flush()
             response.success = True
-            response.message = f'Sent {len(request.data)} bytes'
+            response.message = f'Sent {len(data)} bytes'
         except Exception as e:
             response.success = False
             response.message = str(e)
