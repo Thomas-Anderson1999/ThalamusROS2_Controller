@@ -1,5 +1,6 @@
 import sys
 import time
+import copy
 import threading
 import numpy as np
 import cv2
@@ -12,6 +13,7 @@ from PyQt5.QtCore import QTimer, Qt
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from camera_pub.ui_utils import StreamingWindow
+from camera_pub.ThalamusJoystick import ThalamusJoystick
 from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
@@ -194,6 +196,14 @@ class Window(QWidget, UIBase):
         self.control_timer = QTimer(self)
         self.control_timer.start(80)
         self.control_timer.timeout.connect(self.control_timer_slot)
+
+        self.joystick = ThalamusJoystick()
+        self.old_hat = [0, 0]
+        self.tilting_servo = -999999
+        self.panning_servo = -999999
+        self.joystick_timer = QTimer(self)
+        self.joystick_timer.start(100)
+        self.joystick_timer.timeout.connect(self.joystick_timer_slot)
 
     # ── odometry helpers ───────────────────────────────────────
     def enc_val_reset(self):
@@ -566,7 +576,85 @@ class Window(QWidget, UIBase):
         if selected:
             self.set_ui_val("SendStr", selected[0])
 
+    # ── joystick ───────────────────────────────────────────────
+    def KeepGoing(self):
+        pass
+
+    def Stopping(self):
+        pass
+
+    def joystick_timer_slot(self):
+        hat, btn, axis = self.joystick.get_status()
+
+        if len(btn) > 0:
+            if btn[4] == 1 or btn[5] == 1:  # L1/R1: 모션 취소
+                self.MotCancel()
+
+            if btn[6] == 1:  # L2: 틸트 + 패닝
+                if len(axis) > 4:
+                    servo_tilt_angle = int(45 + axis[4] * 45)
+
+                    #+하드웨어 특성에 따른 수정 : 내가 가진 조이스틱이 오른쪽 아날로그가 최대 0.41밖에 안나옴
+                    raw_pan = axis[3]
+                    if raw_pan > 0:
+                        raw_pan = min(raw_pan / 0.41, 1.0)
+                    servo_panning_angle = int(raw_pan * 135)
+                    #-하드웨어 특성에 따른 수정
+
+                    if int(self.get_ui_val("TiltAngle", float) or 0) != servo_tilt_angle:
+                        self.set_ui_val("TiltAngle", str(servo_tilt_angle))
+                        self.SetTilt()
+                    elif int(self.get_ui_val("PanningAngle", float) or 0) != servo_panning_angle:
+                        self.set_ui_val("PanningAngle", str(servo_panning_angle))
+                        self.SetPanning()
+
+            #print("axis:", " ".join(f"{v:6.2f}" for v in axis))
+
+        # D-pad 전진 / 후진
+        if hat[1] == 1:
+            if self.old_hat[1] == hat[1]:
+                self.KeepGoing()
+            else:
+                self.MoveFoward()
+        elif hat[1] == -1:
+            if self.old_hat[1] == hat[1]:
+                self.KeepGoing()
+            else:
+                self.MoveBackward()
+        elif hat[1] == 0:
+            if self.old_hat[1] != hat[1]:
+                self.Stopping()
+
+        # D-pad 회전
+        if hat[0] == 1:
+            if self.old_hat[0] == hat[0]:
+                self.KeepGoing()
+            else:
+                self.RotateRight()
+        elif hat[0] == -1:
+            if self.old_hat[0] == hat[0]:
+                self.KeepGoing()
+            else:
+                self.RotateLeft()
+        elif hat[0] == 0:
+            if self.old_hat[0] != hat[0]:
+                self.Stopping()
+
+        # 버튼 3: 프리셋
+        if len(btn) > 3:
+            if btn[3] == 1:
+                self.set_ui_val("SendStr", "SV 1 1425")
+                self.SendStr()
+                time.sleep(0.3)
+                self.set_ui_val("SendStr", "SV -1 211")
+                self.SendStr()
+
+        self.old_hat = copy.deepcopy(hat)
+
     def quit_app(self):
+        self.joystick_timer.stop()
+        self.control_timer.stop()
+        self.measure_timer.stop()
         QApplication.quit()
 
 
