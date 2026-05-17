@@ -151,7 +151,7 @@ class UIBase:
                 btn = QPushButton(element.caption, self)
                 if element.default_val is not None:
                     btn.clicked.connect(element.default_val)
-                grid.addWidget(btn, pos_j, pos_i)
+                grid.addWidget(btn, pos_j, pos_i, element.row, element.culumn)
                 pos_i += element.culumn
                 continue
 

@@ -93,6 +93,7 @@ class Window(QWidget, UIBase):
         start_ele_list = [
             UIElement(_type=UIElementType.BUTTON, _caption="SavePreset",    _default_val=self.SavePreset),
             UIElement(_type=UIElementType.BUTTON, _caption="LoadPreset",    _default_val=self.LoadPreset),
+            UIElement(_type=UIElementType.BUTTON, _caption="Quit",          _default_val=self.quit_app),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT,   _caption="SendStr",       _default_val=""),
             UIElement(_type=UIElementType.BUTTON, _caption="SendStr",       _default_val=self.SendStr),
@@ -151,7 +152,7 @@ class Window(QWidget, UIBase):
         self.mainGrid.setRowMinimumHeight(2, 300)
 
         self.setLayout(self.mainGrid)
-        self.setWindowTitle("UI Controller")
+        self.setWindowTitle("Basic Control")
         self.resize(1000, 1000)
         self.LoadPreset()
 
@@ -358,6 +359,58 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
+    def preset_control(self, tilt, pan):
+        self.set_ui_val("TiltAngle",    self.get_ui_val(tilt))
+        self.set_ui_val("PanningAngle", self.get_ui_val(pan))
+        self.SetTilt()
+        time.sleep(0.2)
+        self.SetPanning()
+
+    def quit_app(self):
+        QApplication.quit()
+
+
+class PresetCamWindow(QWidget, UIBase):
+    def __init__(self, parent_window: Window):
+        super(PresetCamWindow, self).__init__()
+        UIBase.__init__(self)
+
+        self.parent_window = parent_window
+        self.ui_dic_list   = parent_window.ui_dic_list  # share ui state
+
+        tilt     = ["UP", "MD", "DN"]
+        tilt_def = [0,    20,   65  ]
+        pan      = ["LLL", "LL", "L", "N", "R", "RR", "RRR"]
+        pan_def  = [-127,  -82, -37,   8,  53,   98,   135 ]
+
+        # ── pan angle header ───────────────────────────────────
+        ele_list = []
+        for p, d in zip(pan, pan_def):
+            ele_list.append(UIElement(_type=UIElementType.EDIT, _caption=p, _default_val=str(d)))
+        ele_list.append(UIElement(_type=UIElementType.NEW_LINE))
+
+        # ── tilt rows × pan buttons ────────────────────────────
+        for t, td in zip(tilt, tilt_def):
+            ele_list.append(UIElement(_type=UIElementType.EDIT, _caption=t, _default_val=str(td)))
+            for p in pan:
+                colspan = 6 if p == "N" else 1
+                ele_list.append(UIElement(
+                    _type=UIElementType.BUTTON,
+                    _caption=f"{p} {t}",
+                    _default_val=lambda state, _t=t, _p=p: self.parent_window.preset_control(_t, _p),
+                    _defalt_culumn=colspan,
+                ))
+            ele_list.append(UIElement(_type=UIElementType.NEW_LINE))
+
+        mainGrid = QGridLayout()
+        subgrid, dic = self.createGroupBox("Preset Cam Control", ele_list)
+        self.ui_dic_list.append(dic)
+        mainGrid.addWidget(subgrid, 0, 0)
+
+        self.setLayout(mainGrid)
+        self.setWindowTitle("Auto Control")
+        self.resize(1200, 200)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -369,6 +422,8 @@ def main(args=None):
     app = QApplication(sys.argv)
     window = Window(ros_node)
     window.show()
+    preset_cam_window = PresetCamWindow(window)
+    preset_cam_window.show()
     ret = app.exec_()
 
     ros_node.destroy_node()
