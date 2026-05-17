@@ -56,7 +56,8 @@ class CameraNodeD455i(Node):
 
         if self._motion_sensor:
             imu_profiles = [p for p in self._motion_sensor.get_stream_profiles()
-                            if p.stream_type() in (rs.stream.gyro, rs.stream.accel)]
+                            if (p.stream_type() == rs.stream.gyro  and p.fps() == 200)
+                            or (p.stream_type() == rs.stream.accel and p.fps() == 63)]
 
             def _imu_cb(frame):
                 motion = frame.as_motion_frame()
@@ -69,6 +70,8 @@ class CameraNodeD455i(Node):
                 elif st == rs.stream.accel:
                     self.ahrs.push_accel(d.x, d.y, d.z)
 
+            for p in imu_profiles:
+                self.get_logger().info(f"IMU profile: {p.stream_type()} @ {p.fps()} Hz")
             self._motion_sensor.open(imu_profiles)
             self._motion_sensor.start(_imu_cb)
             self.get_logger().info("IMU sensor started")
