@@ -1,4 +1,4 @@
-{"x": 216, "y": 1299, "width": 700, "height": 658}
-{"SendStr": "RT 1 600 -803", "TiltAngle": "23", "PanningAngle": "0", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "30"}
-{"camera_roll": "1.1", "camera_pitch": "-1.6", "camera_yaw": "-19.9", "enc1": "804", "enc2": "-805", "spd1": "5", "spd2": "-5", "stat1": "0", "stat2": "3"}
+{"x": 0, "y": 1080, "width": 1000, "height": 1000}
+{"SendStr": "", "TiltAngle": "45", "PanningAngle": "0", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "90"}
+{"camera_roll": "-1.5", "camera_pitch": "-2.7", "camera_yaw": "-35.6", "enc1": "0", "enc2": "0", "spd1": "0", "spd2": "0", "stat1": "0", "stat2": "0"}
 {}

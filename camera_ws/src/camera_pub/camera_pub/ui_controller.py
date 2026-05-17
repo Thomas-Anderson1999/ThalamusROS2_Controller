@@ -2,6 +2,7 @@ import sys
 import time
 import threading
 import numpy as np
+import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -10,8 +11,10 @@ from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import QTimer
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
+from camera_pub.ui_utils import StreamingWindow
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
+from sensor_msgs.msg import CompressedImage, Image
 from serial_interfaces.srv import SerialBypass
 
 
@@ -28,6 +31,11 @@ class UIControllerNode(Node):
 
         self.attitude    = None  # Vector3
         self.motion_data = None  # (enc1, enc2, spd1, spd2, stat1, stat2)
+        self.rgb_image   = None  # numpy BGR
+        self.depth_image = None  # numpy float32
+
+        self.create_subscription(CompressedImage, '/camera/rgb/compressed', self._on_rgb, 10)
+        self.create_subscription(Image, '/camera/depth', self._on_depth, 10)
 
     def _on_serial_msg(self, msg):
         print(f'[serial] {msg.data}')
@@ -46,6 +54,13 @@ class UIControllerNode(Node):
 
     def _on_attitude(self, msg):
         self.attitude = msg
+
+    def _on_rgb(self, msg):
+        arr = np.frombuffer(msg.data, np.uint8)
+        self.rgb_image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def _on_depth(self, msg):
+        self.depth_image = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
 
     def send_serial(self, raw_str):
         if not self.cli.service_is_ready():
@@ -88,9 +103,9 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.BUTTON, _caption="SetPanning",    _default_val=self.SetPanning),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT,   _caption="MVSpd",         _default_val="1600"),
-            UIElement(_type=UIElementType.EDIT,   _caption="Distance",      _default_val="4646"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Distance",      _default_val="500"),
             UIElement(_type=UIElementType.EDIT,   _caption="RotSpd",        _default_val="600"),
-            UIElement(_type=UIElementType.EDIT,   _caption="RotAngle",      _default_val="4646"),
+            UIElement(_type=UIElementType.EDIT,   _caption="RotAngle",      _default_val="90"),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="MotCancel",     _default_val=self.MotCancel),
             UIElement(_type=UIElementType.BUTTON, _caption="MoveFoward",    _default_val=self.MoveFoward),
@@ -105,7 +120,8 @@ class Window(QWidget, UIBase):
 
         # ── communication ──────────────────────────────────────
         start_ele_list = [
-            UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry", _default_val=self.reset_odometry),
+            UIElement(_type=UIElementType.BUTTON, _caption="open_streaming",  _default_val=self.open_streaming),
+            UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry",  _default_val=self.reset_odometry),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="camera_pitch", _default_val="0"),
@@ -143,6 +159,7 @@ class Window(QWidget, UIBase):
         self.enc_val_reset()
         self.reset_odometry()
         self.update_odometry = False
+        self._streaming = False
 
         self.measure_timer = QTimer(self)
         self.measure_timer.start(50)
@@ -168,8 +185,31 @@ class Window(QWidget, UIBase):
             np.asarray([0.0]), np.asarray([0.0]), np.asarray([90.0]), 0
         ])
 
+    # ── streaming ──────────────────────────────────────────────
+    def open_streaming(self):
+        self._streaming_window = StreamingWindow()
+        self._streaming_window.show()
+        self._streaming = True
+
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
+        if self._streaming:
+            rgb = self.ros_node.rgb_image
+            depth = self.ros_node.depth_image
+            if rgb is not None:
+                self._streaming_window.update_rgb(rgb)
+            if depth is not None:
+                d = depth.copy()
+                d[~np.isfinite(d)] = 0
+                valid = d[d > 0]
+                if valid.size > 0:
+                    mn, mx = np.percentile(valid, 1), np.percentile(valid, 99)
+                    d = np.clip(d, mn, mx)
+                    d = ((d - mn) / (mx - mn) * 255).astype(np.uint8)
+                else:
+                    d = np.zeros_like(d, dtype=np.uint8)
+                self._streaming_window.update_depth(cv2.applyColorMap(d, cv2.COLORMAP_TURBO))
+
         att = self.ros_node.attitude
         if att is not None:
             self.set_ui_val("camera_roll",  f"{att.x:.1f}")
@@ -202,16 +242,22 @@ class Window(QWidget, UIBase):
                 self.cam_yaw_bias = cam_yaw
             self.cam_yaw_list.append(cam_yaw)
 
+            def return_rated_minmax(_min, _max, _rate=1.1):
+                _ctr = (_min + _max) / 2
+                _min = (_min - _ctr) * _rate + _ctr
+                _max = (_max - _ctr) * _rate + _ctr
+                return _min, _max
+
             x     = np.array(self.enc_idx)
             _enc1 = np.array(self.enc_dist1)
             _enc2 = np.array(self.enc_dist2)
-            l_enc_min = min([_enc1.min(), _enc2.min()])
-            l_enc_max = max([_enc1.max(), _enc2.max()])
+            l_enc_min, l_enc_max = return_rated_minmax(min([_enc1.min(), _enc2.min()]),
+                                                        max([_enc1.max(), _enc2.max()]))
 
             _spd1 = np.array(self.enc_spd1)
             _spd2 = np.array(self.enc_spd2)
-            l_spd_min = min([_spd1.min(), _spd2.min()])
-            l_spd_max = max([_spd1.max(), _spd2.max()])
+            l_spd_min, l_spd_max = return_rated_minmax(min([_spd1.min(), _spd2.min()]),
+                                                        max([_spd1.max(), _spd2.max()]))
 
 
             self.setUIVal("Graph1D_Enc", [
@@ -225,11 +271,15 @@ class Window(QWidget, UIBase):
             _yaw     = (_enc1 - _enc2) / rotate_pi_per_enc / 2 * 180
             _cam_yaw = np.array(self.cam_yaw_list) - self.cam_yaw_bias
 
-            l_yaw_min = min([_yaw.min(), _cam_yaw.min()])
-            l_yaw_max = max([_yaw.max(), _cam_yaw.max()])
+            _neg_yaw = -_yaw
+            l_yaw_min = min([_neg_yaw.min(), _cam_yaw.min()])
+            l_yaw_max = max([_neg_yaw.max(), _cam_yaw.max()])
+
+            l_yaw_min,l_yaw_max =  return_rated_minmax(l_yaw_min, l_yaw_max)
+
             self.setUIVal("Graph1D_DistYaw", [
-                (x, -_yaw,     ['l', l_yaw_min,    l_yaw_max],    "enc_yaw", "r"),
-                (x, _cam_yaw, ['l', l_yaw_min,    l_yaw_max],    "cam_yaw", "g"),
+                (x, _neg_yaw,  ['l', l_yaw_min, l_yaw_max], "enc_yaw", "r"),
+                (x, _cam_yaw,  ['l', l_yaw_min, l_yaw_max], "cam_yaw", "g"),
             ])
 
             if self.update_odometry:
