@@ -1,5 +1,14 @@
+import os
 import time
+import sys
 import numpy as np
+import cv2
+
+from ultralytics import YOLO
+
+_PKG_DIR       = os.path.dirname(os.path.abspath(__file__))
+_LIGHT_WEIGHT  = os.path.join(_PKG_DIR, "cnn_weight", "light_best.pt")
+_PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt
@@ -112,7 +121,8 @@ class PresetCamWindow(QWidget, UIBase):
 
         # ── Image Processing ──────────────────────────────────
         info_ele_list = [
-            UIElement(_type=UIElementType.BUTTON, _caption="excute_first_action", _default_val=self.excute_first_action),
+            UIElement(_type=UIElementType.BUTTON, _caption="predict_light", _default_val=self.predict_light),
+            UIElement(_type=UIElementType.BUTTON, _caption="predict_person", _default_val=self.predict_person),
         ]
         subgrid2, dic2 = self.createGroupBox("Image Process", info_ele_list)
         self.ui_dic_list.append(dic2)
@@ -122,6 +132,51 @@ class PresetCamWindow(QWidget, UIBase):
         self.setLayout(mainGrid)
         self.setWindowTitle("Auto Control")
         self.resize(1200, 400)
+
+    # ── Image Processing ──────────────────────────────────
+    def _get_camera_frame(self):
+        if not self.parent_window._streaming:
+            print("[predict] 스트리밍이 열려있지 않습니다. open_streaming 먼저 실행하세요.")
+            return None
+        img = self.parent_window.ros_node.rgb_image
+        if img is None:
+            print("[predict] 카메라 이미지가 없습니다.")
+            return None
+        return img.copy()
+
+    def _draw_and_show(self, img, results, names, window_title):
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf  = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            label = f"{names[cls_id]} {conf:.2f}"
+            color = (0, 255, 0)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(img, (x1, y1 - th - 5), (x1 + tw, y1), color, -1)
+            cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        cv2.imshow(window_title, img)
+        cv2.waitKey(1)
+
+    def predict_light(self):
+        img = self._get_camera_frame()
+        if img is None:
+            return
+        if not hasattr(self, '_model_light') or self._model_light is None:
+            print(f"[predict_light] 모델 로딩: {_LIGHT_WEIGHT}")
+            self._model_light = YOLO(_LIGHT_WEIGHT)
+        results = self._model_light(img, conf=0.25, iou=0.5)[0]
+        self._draw_and_show(img, results, self._model_light.names, "Light Detection")
+
+    def predict_person(self):
+        img = self._get_camera_frame()
+        if img is None:
+            return
+        if not hasattr(self, '_model_person') or self._model_person is None:
+            print(f"[predict_person] 모델 로딩: {_PERSON_WEIGHT}")
+            self._model_person = YOLO(_PERSON_WEIGHT)
+        results = self._model_person(img, conf=0.25, iou=0.5)[0]
+        self._draw_and_show(img, results, self._model_person.names, "Person Detection")
 
     # ── preset cam control ─────────────────────────────────────
     def preset_control(self, tilt, pan):
