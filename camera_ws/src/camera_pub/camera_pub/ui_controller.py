@@ -14,24 +14,14 @@ from PyQt5.QtCore import QTimer, Qt
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from camera_pub.ui_utils import StreamingWindow
 from camera_pub.ThalamusJoystick import ThalamusJoystick
-from ThalamusEngine.Interface import Pixelto3D
-from camera_pub.AutoControl import PresetCamWindow, _init_thalamus
+from camera_pub.AutoControl import (
+    PresetCamWindow, _init_thalamus,
+    meter_per_enc, rotate_pi_per_enc, get_tilt_servo_angle,
+)
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import CompressedImage, Image
 from serial_interfaces.srv import SerialBypass
-
-
-meter_per_enc = 11600
-rotate_pi_per_enc = 4819
-
-
-def get_tilt_servo_angle(cam_angle):
-    _CAM_ANGLES   = np.array([20, 10, 0, -13, -27, -40, -54, -90], dtype=float)
-    _SERVO_ANGLES = np.array([ 0,  9, 19,  29,  39,  49,  59,  69], dtype=float)
-    cam_angle = np.clip(cam_angle, _CAM_ANGLES.min(), _CAM_ANGLES.max())
-    servo = np.interp(cam_angle, _CAM_ANGLES[::-1], _SERVO_ANGLES[::-1])
-    return int(np.clip(servo, 0, 90))
 
 
 class UIControllerNode(Node):
@@ -173,6 +163,8 @@ class Window(QWidget, UIBase):
         self.reset_odometry()
         self.update_odometry = False
         self._streaming = False
+        self._click_cb    = None
+        self._dblclick_cb = None
 
         self.sequential_cmd_list = []
 
@@ -191,6 +183,10 @@ class Window(QWidget, UIBase):
         self.joystick_timer = QTimer(self)
         self.joystick_timer.start(100)
         self.joystick_timer.timeout.connect(self.joystick_timer_slot)
+
+    def register_auto_callbacks(self, click_cb, dblclick_cb):
+        self._click_cb    = click_cb
+        self._dblclick_cb = dblclick_cb
 
     # ── odometry helpers ───────────────────────────────────────
     def enc_val_reset(self):
@@ -215,111 +211,12 @@ class Window(QWidget, UIBase):
     # ── streaming ──────────────────────────────────────────────
     def open_streaming(self):
         self._streaming_window = StreamingWindow()
-        self._streaming_window.set_click_cb(self._on_image_click)
-        self._streaming_window.set_dblclick_cb(self.set_clicked_pos)
+        if self._click_cb:
+            self._streaming_window.set_click_cb(self._click_cb)
+        if self._dblclick_cb:
+            self._streaming_window.set_dblclick_cb(self._dblclick_cb)
         self._streaming_window.show()
         self._streaming = True
-
-    def _on_image_click(self, name, x, y):
-        self.set_ui_val("ClickPosX", str(x))
-        self.set_ui_val("ClickPosY", str(y))
-        print(f"[click] name={name} x={x} y={y}")
-
-        # ── TgtPan / TgtTilt 계산 ──────────────────────────────
-        rgb = self.ros_node.rgb_image
-        if rgb is None:
-            print("[click] rgb is None, skip")
-            return
-        img_h, img_w = rgb.shape[:2]
-        tx = int(1280 * x / img_w)
-        ty = int(720  * y / img_h)
-        print(f"[click] tx={tx} ty={ty}")
-
-        if not _init_thalamus():
-            print("[click] thalamus not ready")
-            return
-        try:
-            norm_vec = np.array(Pixelto3D(tx, ty, 1))
-            print(f"[click] norm_vec={norm_vec}")
-        except Exception as e:
-            print(f"[click] Pixelto3D error: {e}")
-            return
-
-        nx, ny, nz = tuple(norm_vec)
-
-        pan_angle  = np.degrees(np.arctan2(nx, nz))
-        tilt_deg   = np.degrees(np.arctan2(-ny, np.sqrt(nx*nx + nz*nz)))
-
-        current_tilt = self.get_ui_val("camera_pitch", float) or 0.0
-        tilt_servo   = get_tilt_servo_angle(current_tilt + tilt_deg)
-        pan_servo    = int(pan_angle - (self.get_ui_val("N", int) or 0))
-        print(f"[click] pan_servo={pan_servo} tilt_servo={tilt_servo}")
-
-        self.set_ui_val("TgtPan",  str(pan_servo))
-        self.set_ui_val("TgtTilt", str(tilt_servo))
-
-        # ── TgtPos / TgtDist / TgtBearing 계산 ────────────────
-        def rotate_vector(v, pitch, roll, yaw):
-            pitch, roll, yaw = np.deg2rad(pitch), np.deg2rad(roll), np.deg2rad(yaw)
-            Rx = np.array([[1,0,0],[0,np.cos(pitch),-np.sin(pitch)],[0,np.sin(pitch),np.cos(pitch)]])
-            Ry = np.array([[np.cos(yaw),0,np.sin(yaw)],[0,1,0],[-np.sin(yaw),0,np.cos(yaw)]])
-            Rz = np.array([[np.cos(roll),-np.sin(roll),0],[np.sin(roll),np.cos(roll),0],[0,0,1]])
-            return Rz @ Ry @ Rx @ v
-
-        def get_crosspnt(v, pos=700.0):
-            v = np.asarray(v, dtype=float)
-            ny_ = v[1]
-            if abs(ny_) < 1e-8 or pos / ny_ <= 0:
-                return np.array([0., 0., 0.])
-            return v * (pos / ny_)
-
-        odom_x   = self.odom_x[-1]   if self.odom_x   else 0.0
-        odom_y   = self.odom_y[-1]   if self.odom_y   else 0.0
-        odom_yaw = self.odom_yaw[-1] if self.odom_yaw else 90.0
-
-        cam_pitch = self.get_ui_val("camera_pitch", float) or 0.0
-        cam_pan   = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
-        norm_rot  = rotate_vector(norm_vec, cam_pitch, 0, odom_yaw + cam_pan)
-
-        depth_src = self.get_ui_val("Depth_Src") or "Virtual_Plane"
-        if depth_src == "Depth_Map":
-            depth = self.ros_node.depth_image
-            if depth is not None:
-                dh, dw = depth.shape
-                dx_ = int(dw * x / img_w)
-                dy_ = int(dh * y / img_h)
-                tgt_depth_m = float(depth[dy_, dx_])
-                if np.isfinite(tgt_depth_m) and tgt_depth_m > 0:
-                    pnt_3d = norm_rot * tgt_depth_m * 1000.0  # m → mm
-                else:
-                    pnt_3d = get_crosspnt(norm_rot)
-            else:
-                pnt_3d = get_crosspnt(norm_rot)
-        else:
-            pnt_3d = get_crosspnt(norm_rot)
-
-        self.set_ui_val("TgtPosX", f"{odom_y + pnt_3d[2] / 1000:.3f}")
-        self.set_ui_val("TgtPosY", f"{pnt_3d[1] / 1000:.3f}")
-        self.set_ui_val("TgtPosZ", f"{odom_x + pnt_3d[0] / 1000:.3f}")
-
-        veh_dist = float(min(np.sqrt(pnt_3d[0]**2 + pnt_3d[2]**2), 2500))
-        self.set_ui_val("TgtDist", f"{int(veh_dist)}")
-
-        bearing_deg = int(pan_angle - (self.get_ui_val("N", int) or 0) + (self.get_ui_val("PanningAngle", int) or 0))
-        self.set_ui_val("TgtBearing", f"{bearing_deg}")
-
-        # ── Ctrl+클릭: SeqCmd 자동 생성 ────────────────────────
-        if QApplication.keyboardModifiers() & Qt.ControlModifier:
-            self.sequential_cmd_list = []
-            if abs(bearing_deg) > 1:
-                spd = self.getUIVal("RotSpd")[0]
-                rotate_dist = int(bearing_deg / 180 * rotate_pi_per_enc)
-                self.sequential_cmd_list.append(f"RT 1 {spd} {rotate_dist}")
-            if veh_dist > 100:
-                spd = self.getUIVal("MVSpd")[0]
-                fwd_dist = int(veh_dist / 1000 * meter_per_enc)
-                self.sequential_cmd_list.append(f"MV 1 {spd} -{fwd_dist}")
-            self.setUIVal("SeqCmd", self.sequential_cmd_list)
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
@@ -388,7 +285,6 @@ class Window(QWidget, UIBase):
             _spd2 = np.array(self.enc_spd2)
             l_spd_min, l_spd_max = return_rated_minmax(min([_spd1.min(), _spd2.min()]),
                                                         max([_spd1.max(), _spd2.max()]))
-
 
             self.setUIVal("Graph1D_Enc", [
                 (x, _enc1, ['l', l_enc_min, l_enc_max], "enc1(left)",  "r"),
@@ -492,21 +388,6 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def preset_control(self, tilt, pan):
-        self.set_ui_val("TiltAngle",    self.get_ui_val(tilt))
-        self.set_ui_val("PanningAngle", self.get_ui_val(pan))
-        self.SetTilt()
-        time.sleep(0.2)
-        self.SetPanning()
-
-    def set_clicked_pos(self):
-        self.set_ui_val("TiltAngle", self.get_ui_val("TgtTilt"))
-        self.SetTilt()
-        time.sleep(0.2)
-        pan = (self.get_ui_val("PanningAngle", float) or 0.0) + (self.get_ui_val("TgtPan", float) or 0.0)
-        self.set_ui_val("PanningAngle", str(int(pan)))
-        self.SetPanning()
-
     # ── 80 ms control timer ────────────────────────────────────
     def control_timer_slot(self):
         mode = self.get_ui_val("CamTrackMode") or "None"
@@ -545,23 +426,6 @@ class Window(QWidget, UIBase):
             elif abs(tilt_servo - (self.get_ui_val("TiltAngle", int) or 0)) > 1:
                 self.set_ui_val("TiltAngle", f"{tilt_servo}")
                 self.SetTilt()
-
-    def excute_first_action(self):
-        self.MotCancel()
-        time.sleep(0.25)
-        if not self.sequential_cmd_list:
-            return
-        first_cmd = self.sequential_cmd_list[0]
-        self.update_odometry = True
-        self.set_ui_val("SendStr", first_cmd)
-        self.SendStr()
-        self.sequential_cmd_list = self.sequential_cmd_list[1:]
-        self.setUIVal("SeqCmd", self.sequential_cmd_list)
-
-    def on_listbox_changed(self, key):
-        selected = self.getUIVal(key)
-        if selected:
-            self.set_ui_val("SendStr", selected[0])
 
     # ── joystick ───────────────────────────────────────────────
     def KeepGoing(self):
@@ -645,7 +509,6 @@ class Window(QWidget, UIBase):
         QApplication.quit()
 
 
-
 def main(args=None):
     _init_thalamus()
     rclpy.init(args=args)
@@ -656,8 +519,12 @@ def main(args=None):
 
     app = QApplication(sys.argv)
     window = Window(ros_node)
-    window.show()
     preset_cam_window = PresetCamWindow(window)
+    window.register_auto_callbacks(
+        preset_cam_window._on_image_click,
+        preset_cam_window.set_clicked_pos,
+    )
+    window.show()
     preset_cam_window.show()
     ret = app.exec_()
 
