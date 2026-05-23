@@ -11,7 +11,8 @@ _LIGHT_WEIGHT  = os.path.join(_PKG_DIR, "cnn_weight", "light_best.pt")
 _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
+from camera_pub.img_proc_main import img_proc_odometry
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D
@@ -123,6 +124,7 @@ class PresetCamWindow(QWidget, UIBase):
         info_ele_list = [
             UIElement(_type=UIElementType.BUTTON, _caption="predict_light", _default_val=self.predict_light),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_person", _default_val=self.predict_person),
+            UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
         ]
         subgrid2, dic2 = self.createGroupBox("Image Process", info_ele_list)
         self.ui_dic_list.append(dic2)
@@ -177,6 +179,50 @@ class PresetCamWindow(QWidget, UIBase):
             self._model_person = YOLO(_PERSON_WEIGHT)
         results = self._model_person(img, conf=0.25, iou=0.5)[0]
         self._draw_and_show(img, results, self._model_person.names, "Person Detection")
+
+    def qt_imshow(self, title, img):
+        cv2.imshow(title, img)
+        cv2.waitKey(1)
+
+    def image_proc_odometry(self):
+        if not hasattr(self, '_proc_odom_timer'):
+            self._proc_odom_local_idx = 0
+            self._proc_odom_timer = QTimer(self)
+            self._proc_odom_timer.timeout.connect(self._proc_odom_tick)
+
+        if self._proc_odom_timer.isActive():
+            self._proc_odom_timer.stop()
+            print("[image_proc_odometry] 중지")
+        else:
+            self._proc_odom_local_idx = 0
+            self._proc_odom_timer.start(50)
+            print("[image_proc_odometry] 시작")
+
+    def _proc_odom_tick(self):
+        if not self.parent_window._streaming:
+            return
+        rgb   = self.parent_window.ros_node.rgb_image
+        depth = self.parent_window.ros_node.depth_image
+        if rgb is None or depth is None:
+            return
+
+        odom_x   = self.parent_window.odom_x[-1]   if self.parent_window.odom_x   else 0.0
+        odom_y   = self.parent_window.odom_y[-1]   if self.parent_window.odom_y   else 0.0
+        odom_yaw = (self.parent_window.odom_yaw[-1] - self.parent_window.odom_yaw[0]) \
+                   if len(self.parent_window.odom_yaw) > 1 else 0.0
+        local_odometry = np.array([odom_x, odom_y, odom_yaw])
+
+        att = self.parent_window.ros_node.attitude
+        pose_ars = [att.z, att.x, att.y, att.z] if att is not None else [0.0, 0.0, 0.0, 0.0]
+
+        img_proc_odometry(self,
+                          image=rgb.copy(),
+                          depthmap=depth.copy(),
+                          local_idx=self._proc_odom_local_idx,
+                          local_odometry=local_odometry,
+                          pose_ars=pose_ars,
+                          cmd_type=None)
+        self._proc_odom_local_idx += 1
 
     # ── preset cam control ─────────────────────────────────────
     def preset_control(self, tilt, pan):
