@@ -506,6 +506,7 @@ class Window(QWidget, UIBase):
         self.joystick_timer.stop()
         self.control_timer.stop()
         self.measure_timer.stop()
+        cv2.destroyAllWindows()
         QApplication.quit()
 
 

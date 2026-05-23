@@ -13,6 +13,7 @@ _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt, QTimer
 from camera_pub.img_proc_main import img_proc_odometry
+from camera_pub.recon_util import pixel_to_vec
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D
@@ -124,6 +125,7 @@ class PresetCamWindow(QWidget, UIBase):
         info_ele_list = [
             UIElement(_type=UIElementType.BUTTON, _caption="predict_light", _default_val=self.predict_light),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_person", _default_val=self.predict_person),
+            UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
             UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
         ]
         subgrid2, dic2 = self.createGroupBox("Image Process", info_ele_list)
@@ -179,6 +181,90 @@ class PresetCamWindow(QWidget, UIBase):
             self._model_person = YOLO(_PERSON_WEIGHT)
         results = self._model_person(img, conf=0.25, iou=0.5)[0]
         self._draw_and_show(img, results, self._model_person.names, "Person Detection")
+
+    def predict_floor_ransac(self):
+        if not self.parent_window._streaming:
+            print("[predict_floor_ransac] 스트리밍이 열려있지 않습니다.")
+            return
+        depth = self.parent_window.ros_node.depth_image
+        if depth is None:
+            print("[predict_floor_ransac] depth 이미지가 없습니다.")
+            return
+
+        target_shape = (720, 1280)
+        depth = depth * 1000.0  # m → mm
+        img_h, img_w = depth.shape
+
+        # pixel → 3D point map
+        point_map = np.zeros((img_h, img_w, 3), dtype=np.float32)
+        for py in range(img_h):
+            for px in range(img_w):
+                point_map[py, px] = pixel_to_vec(px, py, target_shape, depth)
+
+        # 카메라 roll/pitch로 카메라 프레임에서의 바닥 노말 산출
+        # pitch 마이너스 = 아래 봄, roll 플러스 = 오른쪽으로 기울
+        att = self.parent_window.ros_node.attitude
+        cam_pitch = att.y if att is not None else 0.0
+        cam_roll  = att.x if att is not None else 0.0
+
+        p = np.deg2rad(cam_pitch)
+        r = np.deg2rad(cam_roll)
+
+        # 월드 바닥 노말 (Y-down 계 → 위쪽 = [0,-1,0])
+        # R_cam_to_world = Rz(roll) @ Rx(pitch)
+        # n_cam = Rx(pitch)^T @ Rz(roll)^T @ n_world
+        Rx_T = np.array([[1, 0,           0          ],
+                         [0, np.cos(p),   np.sin(p)  ],
+                         [0, -np.sin(p),  np.cos(p)  ]])
+        Rz_T = np.array([[np.cos(r),  np.sin(r), 0],
+                         [-np.sin(r), np.cos(r), 0],
+                         [0,          0,          1]])
+        n_floor_cam = Rx_T @ Rz_T @ np.array([0.0, -1.0, 0.0])
+
+        # RANSAC plane fitting
+        pts = point_map.reshape(-1, 3)
+        pts = pts[pts[:, 2] > 0]
+
+        best_normal    = None
+        best_d         = 0
+        best_inlier_cnt = 0
+        ransac_iter    = 200
+        dist_th        = 50.0  # mm
+
+        rng = np.random.default_rng()
+        for _ in range(ransac_iter):
+            idx = rng.choice(len(pts), 3, replace=False)
+            p0, p1, p2 = pts[idx]
+            v1 = p1 - p0
+            v2 = p2 - p0
+            normal = np.cross(v1, v2)
+            n_len = np.linalg.norm(normal)
+            if n_len < 1e-6:
+                continue
+            normal = normal / n_len
+            # 산출된 바닥 노말 방향과 일치하는지 확인
+            if abs(np.dot(normal, n_floor_cam)) < 0.7:
+                continue
+            d = np.dot(normal, p0)
+            dists = np.abs(pts @ normal - d)
+            inlier_cnt = int(np.sum(dists < dist_th))
+            if inlier_cnt > best_inlier_cnt:
+                best_inlier_cnt = inlier_cnt
+                best_normal = normal
+                best_d = d
+
+        print(f"[predict_floor_ransac] normal={best_normal}, d={best_d:.1f}, inliers={best_inlier_cnt}/{len(pts)}")
+
+        rgb = self.parent_window.ros_node.rgb_image
+        vis = cv2.resize(rgb, (img_w, img_h)) if rgb is not None else np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        if best_normal is not None:
+            flat = point_map.reshape(-1, 3)
+            dists = np.abs(flat @ best_normal - best_d)
+            inlier_mask = ((flat[:, 2] > 0) & (dists < dist_th)).reshape(img_h, img_w)
+            vis[inlier_mask, 1] = 255
+        cv2.imshow("Floor RANSAC", vis)
+        cv2.waitKey(1)
+
 
     def qt_imshow(self, title, img):
         cv2.imshow(title, img)
