@@ -357,7 +357,7 @@ class UIBase:
                     ctl._traj_arrow.setPos(px, py)
                     ctl._traj_arrow.setStyle(angle=180 - pyaw)
                     ctl._traj_text.setPos(px + 0.05, py + 0.05)
-                    ctl._traj_text.setText(f"x={px:.2f}  y={py:.2f}  yaw={pyaw:.1f}°")
+                    ctl._traj_text.setText(f"x={px:.2f}\ny={py:.2f}\nyaw={pyaw:.1f}°")
 
                 # 정사각형 뷰 유지
                 cx = (x.min() + x.max()) / 2

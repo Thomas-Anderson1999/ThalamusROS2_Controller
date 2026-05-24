@@ -129,6 +129,7 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="camera_pitch", _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="camera_yaw",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="odom_yaw",     _default_val="0"),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="enc1",  _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="enc2",  _default_val="0"),
@@ -304,9 +305,10 @@ class Window(QWidget, UIBase):
             l_yaw_min,l_yaw_max =  return_rated_minmax(l_yaw_min, l_yaw_max)
 
             self.setUIVal("Graph1D_DistYaw", [
-                (x, _neg_yaw,  ['l', l_yaw_min, l_yaw_max], "enc_yaw", "r"),
+                (x, _neg_yaw,  ['l', l_yaw_min, l_yaw_max], "odom_yaw", "r"),
                 (x, _cam_yaw,  ['l', l_yaw_min, l_yaw_max], "cam_yaw", "g"),
             ])
+            self.set_ui_val("odom_yaw", f"{self.odom_yaw[-1]:.1f}")
 
             if self.update_odometry:
                 ds    = (_dist[-1] - _dist[-2]) if len(_dist) >= 2 else 0.0
