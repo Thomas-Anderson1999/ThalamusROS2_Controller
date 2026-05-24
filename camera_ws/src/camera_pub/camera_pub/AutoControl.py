@@ -217,8 +217,10 @@ class PresetCamWindow(QWidget, UIBase):
         vis = cv2.resize(rgb, (img_w, img_h)) if rgb is not None else np.zeros((img_h, img_w, 3), dtype=np.uint8)
         vis[display_mask[:, :, 0] > 0, 1] = 255
 
-        close_iter = int(self.get_ui_val("close_iter") or 3)
-        birdview = make_birdview(floor_pts, cam_pitch, cam_roll, close_iter=close_iter)
+        close_iter  = int(self.get_ui_val("close_iter") or 3)
+        cam_heading = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
+        birdview = make_birdview(floor_pts, cam_pitch, cam_roll, close_iter=close_iter,
+                                 cam_heading=cam_heading, cam_axis_pos=100.0)
 
         cv2.imshow("Floor RANSAC", vis)
         cv2.imshow("Floor Mask", display_mask)

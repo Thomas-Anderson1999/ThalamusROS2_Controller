@@ -74,17 +74,20 @@ def depthmap_floor_ransac(depth_mm, target_shape, dist_th, cam_pitch=0.0, cam_ro
     return display_mask, floor_pts
 
 
-def make_birdview(mask, cam_pitch=0.0, cam_roll=0.0, img_size=512, scale=0.05, close_iter=3):
+def make_birdview(mask, cam_pitch=0.0, cam_roll=0.0, img_size=512, scale=0.05, close_iter=3,
+                  cam_heading=0.0, cam_axis_pos=0.0):
     """
-    mask       : (h, w, 3) float32 - 바닥 픽셀의 카메라 프레임 3D 좌표(mm),
-                 비바닥=0  (depthmap_floor_ransac의 floor_pts)
-    close_iter : closing(팽창→침식) 반복 횟수 - 구멍 메우기
-    return     : (img_size, img_size, 3) uint8 bird view
-                 바닥=흰색, 카메라 위치=빨간 점
+    mask         : (h, w, 3) float32 - 바닥 픽셀의 카메라 프레임 3D 좌표(mm),
+                   비바닥=0  (depthmap_floor_ransac의 floor_pts)
+    close_iter   : closing(팽창→침식) 반복 횟수 - 구멍 메우기
+    cam_heading  : 카메라 패닝 각도 (deg) - 로봇 전방 기준 좌우 회전 (PanningAngle - N)
+    cam_axis_pos : 카메라가 로봇 회전축에서 Z축 방향으로 앞으로 나아간 거리 (mm)
+    return       : (img_size, img_size, 3) uint8 bird view
+                   바닥=흰색, 로봇축=빨간 점, 카메라=파란 점
     """
     bv = np.zeros((img_size, img_size, 3), dtype=np.uint8)
     cx = img_size // 2
-    cy = int(img_size * 0.8)
+    cy = int(img_size * 0.8)  # 로봇 회전축 기준
 
     h, w = mask.shape[:2]
     for py in range(h):
@@ -92,9 +95,11 @@ def make_birdview(mask, cam_pitch=0.0, cam_roll=0.0, img_size=512, scale=0.05, c
             pt_cam = mask[py, px]
             if pt_cam[2] <= 0:
                 continue
-            pt_world = rotate_rpy(pt_cam, cam_roll, cam_pitch, 0.0)
+            # roll + pitch + heading 한번에 회전 → 로봇 프레임
+            pt_world = rotate_rpy(pt_cam, cam_roll, cam_pitch, cam_heading)
+            # 카메라가 로봇 축에서 cam_axis_pos mm 전방에 있으므로 Z 보정
             bv_x = int(cx + pt_world[0] * scale)
-            bv_y = int(cy - pt_world[2] * scale)
+            bv_y = int(cy - (pt_world[2] + cam_axis_pos) * scale)
             if 0 <= bv_x < img_size and 0 <= bv_y < img_size:
                 bv[bv_y, bv_x] = (255, 255, 255)
 
@@ -102,5 +107,10 @@ def make_birdview(mask, cam_pitch=0.0, cam_roll=0.0, img_size=512, scale=0.05, c
         kernel = np.ones((3, 3), np.uint8)
         bv = cv2.morphologyEx(bv, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
 
-    cv2.circle(bv, (cx, cy + 2), 2, (0, 0, 255), -1)
+    # 로봇 회전축 - 빨간 점
+    cv2.circle(bv, (cx, cy), 4, (0, 0, 255), -1)
+    # 카메라 위치 (축에서 cam_axis_pos mm 전방) - 파란 점
+    cam_bv_y = cy - int(cam_axis_pos * scale)
+    if 0 <= cam_bv_y < img_size:
+        cv2.circle(bv, (cx, cam_bv_y), 2, (255, 0, 0), -1)
     return bv
