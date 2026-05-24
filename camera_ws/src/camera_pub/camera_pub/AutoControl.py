@@ -123,8 +123,12 @@ class PresetCamWindow(QWidget, UIBase):
 
         # ── Image Processing ──────────────────────────────────
         info_ele_list = [
+            UIElement(_type=UIElementType.EDIT, _caption="conf", _default_val="0.25"),
+            UIElement(_type=UIElementType.EDIT, _caption="iou",  _default_val="0.5"),
+            UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_light", _default_val=self.predict_light),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_person", _default_val=self.predict_person),
+            UIElement(_type=UIElementType.EDIT,   _caption="dist_th",           _default_val="50.0"),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
             UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
         ]
@@ -169,7 +173,9 @@ class PresetCamWindow(QWidget, UIBase):
         if not hasattr(self, '_model_light') or self._model_light is None:
             print(f"[predict_light] 모델 로딩: {_LIGHT_WEIGHT}")
             self._model_light = YOLO(_LIGHT_WEIGHT)
-        results = self._model_light(img, conf=0.25, iou=0.5)[0]
+        conf = float(self.get_ui_val("conf") or 0.25)
+        iou  = float(self.get_ui_val("iou")  or 0.5)
+        results = self._model_light(img, conf=conf, iou=iou)[0]
         self._draw_and_show(img, results, self._model_light.names, "Light Detection")
 
     def predict_person(self):
@@ -179,7 +185,9 @@ class PresetCamWindow(QWidget, UIBase):
         if not hasattr(self, '_model_person') or self._model_person is None:
             print(f"[predict_person] 모델 로딩: {_PERSON_WEIGHT}")
             self._model_person = YOLO(_PERSON_WEIGHT)
-        results = self._model_person(img, conf=0.25, iou=0.5)[0]
+        conf = float(self.get_ui_val("conf") or 0.25)
+        iou  = float(self.get_ui_val("iou")  or 0.5)
+        results = self._model_person(img, conf=conf, iou=iou)[0]
         self._draw_and_show(img, results, self._model_person.names, "Person Detection")
 
     def predict_floor_ransac(self):
@@ -229,7 +237,7 @@ class PresetCamWindow(QWidget, UIBase):
         best_d         = 0
         best_inlier_cnt = 0
         ransac_iter    = 200
-        dist_th        = 50.0  # mm
+        dist_th        = float(self.get_ui_val("dist_th") or 50.0)
 
         rng = np.random.default_rng()
         for _ in range(ransac_iter):
