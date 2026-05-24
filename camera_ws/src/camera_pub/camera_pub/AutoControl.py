@@ -132,6 +132,14 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="dist_th",    _default_val="50.0"),
             UIElement(_type=UIElementType.EDIT,   _caption="close_iter", _default_val="3"),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
+
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="gmap_oy", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="scale_per1pix", _default_val="20"),
+            UIElement(_type=UIElementType.BUTTON, _caption="set_gram_param", _default_val=self.set_gram_param),
+            UIElement(_type=UIElementType.BUTTON, _caption="merge_on_globalmap", _default_val=self.merge_on_globalmap),
+            UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
         ]
         subgrid2, dic2 = self.createGroupBox("Image Process", info_ele_list)
@@ -192,6 +200,108 @@ class PresetCamWindow(QWidget, UIBase):
         results = self._model_person(img, conf=conf, iou=iou)[0]
         self._draw_and_show(img, results, self._model_person.names, "Person Detection")
 
+
+    def set_gram_param(self):
+        if not hasattr(self, '_globalmap'):
+            self._globalmap = np.zeros((512, 512, 3), dtype=np.uint8)
+
+        mm_per_pix = float(self.get_ui_val("scale_per1pix") or 20.0)
+        scale      = 1.0 / mm_per_pix
+        img_size   = 512
+        cx_g       = img_size // 2
+        cy_g       = img_size // 2
+
+        ox_mm = float(self.get_ui_val("gmap_ox") or 0.0) * 1000.0
+        oy_mm = float(self.get_ui_val("gmap_oy") or 0.0) * 1000.0
+
+        # 세계 좌표 (ox_mm, oy_mm) 위치를 맵 픽셀로 변환
+        cx_cross = int(cx_g + ox_mm * scale)
+        cy_cross = int(cy_g - oy_mm * scale)
+
+        # 십자가 팔 길이: 1m = 1000mm / mm_per_pix pixels
+        arm = int(1000.0 * scale)
+
+        display = self._globalmap.copy()
+        cv2.line(display, (cx_cross - arm, cy_cross), (cx_cross + arm, cy_cross), (0, 255, 0), 2)
+        cv2.line(display, (cx_cross, cy_cross - arm), (cx_cross, cy_cross + arm), (0, 255, 0), 2)
+
+        cv2.imshow("Global Map", display)
+        cv2.waitKey(1)
+
+
+
+    def merge_on_globalmap(self):
+        if not hasattr(self, '_last_floor_pts') or self._last_floor_pts is None:
+            print("[merge_on_globalmap] predict_floor_ransac 먼저 실행하세요.")
+            return
+
+        if not hasattr(self, '_globalmap'):
+            self._globalmap = np.zeros((512, 512, 3), dtype=np.uint8)
+
+        img_size   = 512
+        mm_per_pix = float(self.get_ui_val("scale_per1pix") or 20.0)
+        scale      = 1.0 / mm_per_pix
+        ox_mm      = float(self.get_ui_val("gmap_ox") or 0.0) * 1000.0
+        oy_mm      = float(self.get_ui_val("gmap_oy") or 0.0) * 1000.0
+        cx_g       = img_size // 2
+        cy_g       = img_size // 2
+
+        odom_x   = self.parent_window.odom_x[-1]   if self.parent_window.odom_x   else 0.0
+        odom_y   = self.parent_window.odom_y[-1]   if self.parent_window.odom_y   else 0.0
+        odom_yaw = self.parent_window.odom_yaw[-1] if self.parent_window.odom_yaw else 90.0
+        yaw_rad  = np.deg2rad(odom_yaw)
+        print(f"[merge_on_globalmap] odom_x={odom_x:.3f}m  odom_y={odom_y:.3f}m  odom_yaw={odom_yaw:.1f}deg")
+
+        # 바닥 포인트만 추출
+        pts = self._last_floor_pts.reshape(-1, 3)
+        pts = pts[pts[:, 2] > 0]
+        if len(pts) == 0:
+            return
+
+        # 카메라 프레임 → 로봇 프레임 (roll + pitch + heading 일괄 회전)
+        r = np.deg2rad(self._last_cam_roll)
+        p = np.deg2rad(self._last_cam_pitch)
+        h = np.deg2rad(self._last_cam_heading)
+        Rz = np.array([[np.cos(r), -np.sin(r), 0],
+                       [np.sin(r),  np.cos(r), 0],
+                       [0,          0,          1]])
+        Rx = np.array([[1, 0,          0         ],
+                       [0, np.cos(p), -np.sin(p) ],
+                       [0, np.sin(p),  np.cos(p) ]])
+        Ry = np.array([[np.cos(h),  0, np.sin(h)],
+                       [0,          1, 0         ],
+                       [-np.sin(h), 0, np.cos(h)]])
+        R = Ry @ Rx @ Rz
+        pts_robot = (R @ pts.T).T  # (N, 3)
+
+        x_r = pts_robot[:, 0]
+        z_r = pts_robot[:, 2] + 100.0  # cam_axis_pos=100mm 보정 → 로봇 회전축 기준
+
+        # 로봇 프레임 → 월드 프레임 (mm)
+        # forward 방향: (cos(yaw), sin(yaw)) in (odom_x, odom_y)
+        # right   방향: (sin(yaw), -cos(yaw))
+        odom_x_mm = odom_x * 1000.0
+        odom_y_mm = odom_y * 1000.0
+        world_x = odom_x_mm + z_r * np.cos(yaw_rad) + x_r * np.sin(yaw_rad)
+        world_y = odom_y_mm + z_r * np.sin(yaw_rad) - x_r * np.cos(yaw_rad)
+
+        # 현재 프레임 임시 레이어에 포인트 찍기 (세계 0,0 = 맵 중앙)
+        gx = (cx_g + world_x * scale).astype(int)
+        gy = (cy_g - world_y * scale).astype(int)
+        valid = (gx >= 0) & (gx < img_size) & (gy >= 0) & (gy < img_size)
+        layer = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        layer[gy[valid], gx[valid]] = 255
+
+        # MORPH_CLOSE로 구멍 메운 뒤 글로벌맵에 병합
+        close_iter = int(self.get_ui_val("close_iter") or 3)
+        if close_iter > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            layer = cv2.morphologyEx(layer, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+        self._globalmap[layer[:, :, 0] > 0] = 255
+
+        cv2.imshow("Global Map", self._globalmap)
+        cv2.waitKey(1)
+
     def predict_floor_ransac(self):
         if not self.parent_window._streaming:
             print("[predict_floor_ransac] 스트리밍이 열려있지 않습니다.")
@@ -221,6 +331,12 @@ class PresetCamWindow(QWidget, UIBase):
         cam_heading = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
         birdview = make_birdview(floor_pts, cam_pitch, cam_roll, close_iter=close_iter,
                                  cam_heading=cam_heading, cam_axis_pos=100.0)
+
+        # 다음 merge_on_globalmap을 위해 저장
+        self._last_floor_pts   = floor_pts
+        self._last_cam_pitch   = cam_pitch
+        self._last_cam_roll    = cam_roll
+        self._last_cam_heading = cam_heading
 
         cv2.imshow("Floor RANSAC", vis)
         cv2.imshow("Floor Mask", display_mask)
