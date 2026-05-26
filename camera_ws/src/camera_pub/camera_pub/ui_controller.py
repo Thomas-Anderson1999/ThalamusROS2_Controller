@@ -269,6 +269,10 @@ class Window(QWidget, UIBase):
         if stat1 == 0 or stat2 == 0:
             self.enc_val_reset()
         else:
+            # enc 값이 갑자기 크게 감소하면 펌웨어 리셋으로 간주하고 초기화
+            if self.enc_dist1 and enc1 < self.enc_dist1[-1] - 1000:
+                print(f"[odom] enc 불연속 감지 ({self.enc_dist1[-1]} → {enc1}), enc_val_reset")
+                self.enc_val_reset()
             self.enc_idx.append(0 if not self.enc_idx else self.enc_idx[-1] + 1)
             self.enc_dist1.append(enc1)
             self.enc_dist2.append(enc2)
