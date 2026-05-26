@@ -96,6 +96,7 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.BUTTON, _caption="SavePreset",    _default_val=self.SavePreset),
             UIElement(_type=UIElementType.BUTTON, _caption="LoadPreset",    _default_val=self.LoadPreset),
             UIElement(_type=UIElementType.BUTTON, _caption="Quit",          _default_val=self.quit_app),
+            UIElement(_type=UIElementType.BUTTON, _caption="Auto-control", _default_val=self.focus_auto_window),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT,   _caption="SendStr",       _default_val=""),
             UIElement(_type=UIElementType.BUTTON, _caption="SendStr",       _default_val=self.SendStr),
@@ -164,8 +165,9 @@ class Window(QWidget, UIBase):
         self.reset_odometry()
         self.update_odometry = False
         self._streaming = False
-        self._click_cb    = None
-        self._dblclick_cb = None
+        self._click_cb       = None
+        self._dblclick_cb    = None
+        self._preset_cam_win = None
 
         self.sequential_cmd_list = []
 
@@ -188,6 +190,14 @@ class Window(QWidget, UIBase):
     def register_auto_callbacks(self, click_cb, dblclick_cb):
         self._click_cb    = click_cb
         self._dblclick_cb = dblclick_cb
+
+    def register_preset_window(self, w):
+        self._preset_cam_win = w
+
+    def focus_auto_window(self):
+        if self._preset_cam_win is not None:
+            self._preset_cam_win.hide()
+            self._preset_cam_win.show()
 
     # ── odometry helpers ───────────────────────────────────────
     def enc_val_reset(self):
@@ -523,6 +533,7 @@ def main(args=None):
     app = QApplication(sys.argv)
     window = Window(ros_node)
     preset_cam_window = PresetCamWindow(window)
+    window.register_preset_window(preset_cam_window)
     window.register_auto_callbacks(
         preset_cam_window._on_image_click,
         preset_cam_window.set_clicked_pos,

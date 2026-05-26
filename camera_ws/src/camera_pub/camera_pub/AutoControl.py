@@ -63,7 +63,8 @@ class PresetCamWindow(QWidget, UIBase):
 
         # ── pan angle header ───────────────────────────────────
         ele_list = [
-            UIElement(_type=UIElementType.BUTTON, _caption="Quit", _default_val=self.parent_window.quit_app),
+            UIElement(_type=UIElementType.BUTTON, _caption="Quit",          _default_val=self.parent_window.quit_app),
+            UIElement(_type=UIElementType.BUTTON, _caption="Basic control", _default_val=self.focus_basic_window),
             UIElement(_type=UIElementType.NEW_LINE),
         ]
         for p, d in zip(pan, pan_def):
@@ -387,6 +388,10 @@ class PresetCamWindow(QWidget, UIBase):
                           pose_ars=pose_ars,
                           cmd_type=None)
         self._proc_odom_local_idx += 1
+
+    def focus_basic_window(self):
+        self.parent_window.hide()
+        self.parent_window.show()
 
     # ── preset cam control ─────────────────────────────────────
     def preset_control(self, tilt, pan):
