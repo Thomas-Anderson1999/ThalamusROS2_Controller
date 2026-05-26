@@ -132,6 +132,8 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT,   _caption="dist_th",    _default_val="50.0"),
             UIElement(_type=UIElementType.EDIT,   _caption="close_iter", _default_val="3"),
+            UIElement(_type=UIElementType.EDIT,   _caption="forced_px",  _default_val="128,230"),
+            UIElement(_type=UIElementType.EDIT,   _caption="normal_th",  _default_val="0.7"),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
 
             UIElement(_type=UIElementType.NEW_LINE),
@@ -312,8 +314,17 @@ class PresetCamWindow(QWidget, UIBase):
             print("[predict_floor_ransac] depth 이미지가 없습니다.")
             return
 
-        dist_th = float(self.get_ui_val("dist_th") or 50.0)
+        dist_th   = float(self.get_ui_val("dist_th")  or 50.0)
+        normal_th = float(self.get_ui_val("normal_th") or 0.7)
 
+        forced_pixel = None
+        forced_px_str = (self.get_ui_val("forced_px") or "").strip()
+        if forced_px_str:
+            try:
+                fx, fy = [int(v.strip()) for v in forced_px_str.split(",")]
+                forced_pixel = (fx, fy)
+            except Exception:
+                print(f"[predict_floor_ransac] forced_px 파싱 실패: '{forced_px_str}' (예: 100,200)")
 
         att = self.parent_window.ros_node.attitude
         cam_pitch = att.y if att is not None else 0.0
@@ -321,8 +332,12 @@ class PresetCamWindow(QWidget, UIBase):
 
         depth_mm = depth * 1000.0  # m → mm
         img_h, img_w = depth_mm.shape
+        print(f"[predict_floor_ransac] depth image size: {img_w}x{img_h}")
 
-        display_mask, floor_pts = depthmap_floor_ransac(depth_mm, (720, 1280), dist_th, cam_pitch, cam_roll)
+        display_mask, floor_pts = depthmap_floor_ransac(
+            depth_mm, (720, 1280), dist_th, cam_pitch, cam_roll,
+            forced_pixel=forced_pixel, normal_th=normal_th,
+        )
 
         rgb = self.parent_window.ros_node.rgb_image
         vis = cv2.resize(rgb, (img_w, img_h)) if rgb is not None else np.zeros((img_h, img_w, 3), dtype=np.uint8)
