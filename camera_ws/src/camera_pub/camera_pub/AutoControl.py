@@ -405,14 +405,28 @@ class PresetCamWindow(QWidget, UIBase):
         self.parent_window.SetPanning()
 
     def excute_first_action(self):
-        self.parent_window.MotCancel()
-        time.sleep(0.25)
         if not self.parent_window.sequential_cmd_list:
             return
         first_cmd = self.parent_window.sequential_cmd_list[0]
-        self.parent_window.update_odometry = True
-        self.parent_window.set_ui_val("SendStr", first_cmd)
-        self.parent_window.SendStr()
+        parts = first_cmd.split()
+        cmd_type, spd, val = parts[0], parts[1], parts[2]
+        pw = self.parent_window
+        if cmd_type == "MV_FWD":
+            pw.set_ui_val("MVSpd", spd)
+            pw.set_ui_val("Distance", val)
+            pw.MoveFoward()
+        elif cmd_type == "MV_BACK":
+            pw.set_ui_val("MVSpd", spd)
+            pw.set_ui_val("Distance", val)
+            pw.MoveBackward()
+        elif cmd_type == "RT_LEFT":
+            pw.set_ui_val("RotSpd", spd)
+            pw.set_ui_val("RotAngle", val)
+            pw.RotateLeft()
+        elif cmd_type == "RT_RIGHT":
+            pw.set_ui_val("RotSpd", spd)
+            pw.set_ui_val("RotAngle", val)
+            pw.RotateRight()
         self.parent_window.sequential_cmd_list = self.parent_window.sequential_cmd_list[1:]
         self.setUIVal("SeqCmd", self.parent_window.sequential_cmd_list)
 
@@ -515,10 +529,9 @@ class PresetCamWindow(QWidget, UIBase):
             self.parent_window.sequential_cmd_list = []
             if abs(bearing_deg) > 1:
                 spd = self.getUIVal("RotSpd")[0]
-                rotate_dist = int(bearing_deg / 180 * rotate_pi_per_enc)
-                self.parent_window.sequential_cmd_list.append(f"RT 1 {spd} {rotate_dist}")
+                cmd_type = "RT_RIGHT" if bearing_deg > 0 else "RT_LEFT"
+                self.parent_window.sequential_cmd_list.append(f"{cmd_type} {spd} {abs(bearing_deg)}")
             if veh_dist > 100:
                 spd = self.getUIVal("MVSpd")[0]
-                fwd_dist = int(veh_dist / 1000 * meter_per_enc)
-                self.parent_window.sequential_cmd_list.append(f"MV 1 {spd} -{fwd_dist}")
+                self.parent_window.sequential_cmd_list.append(f"MV_FWD {spd} {int(veh_dist)}")
             self.setUIVal("SeqCmd", self.parent_window.sequential_cmd_list)
