@@ -18,6 +18,7 @@ from camera_pub.AutoControl import (
     PresetCamWindow, _init_thalamus,
     meter_per_enc, rotate_pi_per_enc, get_tilt_servo_angle,
 )
+from camera_pub.img_proc_main import reset_img_proc_odometry, stop_vio, set_vio_cmd_type, get_last_vio_yaw
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import CompressedImage, Image
@@ -164,6 +165,7 @@ class Window(QWidget, UIBase):
         self.enc_val_reset()
         self.reset_odometry()
         self.update_odometry = False
+        self._prev_moving = False
         self._streaming = False
         self._click_cb       = None
         self._dblclick_cb    = None
@@ -208,10 +210,18 @@ class Window(QWidget, UIBase):
         self.enc_spd2     = []
         self.cam_yaw_list = []
         self.cam_yaw_bias = None
+        self.cam_yaw_prev = None
+        self.cam_yaw_accum = 0.0
         self.local_yaw    = 0
+        self.vio_yaw_list = []  # enc_idx와 길이 동기화
+
+    def vio_yaw_reset(self):
+        self.vio_yaw_list = []
+        self.vio_yaw_bias = None
 
     def reset_odometry(self):
         self.enc_val_reset()
+        self.vio_yaw_reset()
         self.odom_x   = [0]
         self.odom_y   = [0]
         self.odom_yaw = [90]
@@ -266,8 +276,11 @@ class Window(QWidget, UIBase):
         self.set_ui_val("stat1", str(stat1))
         self.set_ui_val("stat2", str(stat2))
 
-        if stat1 == 0 or stat2 == 0:
+        is_moving = (stat1 != 0 and stat2 != 0)
+        if not is_moving:
             self.enc_val_reset()
+            if self._prev_moving:
+                stop_vio()
         else:
             # enc 값이 갑자기 크게 감소하면 펌웨어 리셋으로 간주하고 초기화
             if self.enc_dist1 and enc1 < self.enc_dist1[-1] - 1000:
@@ -279,10 +292,18 @@ class Window(QWidget, UIBase):
             self.enc_spd1.append(spd1)
             self.enc_spd2.append(spd2)
             att = self.ros_node.attitude
-            cam_yaw = att.z if att is not None else (self.cam_yaw_list[-1] if self.cam_yaw_list else 0.0)
-            if self.cam_yaw_bias is None:
-                self.cam_yaw_bias = cam_yaw
-            self.cam_yaw_list.append(cam_yaw)
+            cam_yaw = att.z if att is not None else (self.cam_yaw_prev if self.cam_yaw_prev is not None else 0.0)
+            if self.cam_yaw_prev is not None:
+                delta_raw = cam_yaw - self.cam_yaw_prev
+                delta = (delta_raw + 180) % 360 - 180  # normalize to [-180, 180]
+                if abs(delta) <= 50:  # 50ms 내 50° 초과 = AHRS 글리치, 스킵
+                    self.cam_yaw_accum += delta
+            self.cam_yaw_prev = cam_yaw
+            self.cam_yaw_list.append(self.cam_yaw_accum)
+            vio_yaw_raw = get_last_vio_yaw()
+            if self.vio_yaw_bias is None:
+                self.vio_yaw_bias = vio_yaw_raw
+            self.vio_yaw_list.append(vio_yaw_raw - self.vio_yaw_bias)
 
             def return_rated_minmax(_min, _max, _rate=1.1):
                 _ctr = (_min + _max) / 2
@@ -310,17 +331,19 @@ class Window(QWidget, UIBase):
 
             _dist    = (_enc1 + _enc2) / 2 / meter_per_enc
             _yaw     = (_enc1 - _enc2) / rotate_pi_per_enc / 2 * 180
-            _cam_yaw = np.array(self.cam_yaw_list) - self.cam_yaw_bias
+            _cam_yaw = np.array(self.cam_yaw_list)
 
             _neg_yaw = -_yaw
-            l_yaw_min = min([_neg_yaw.min(), _cam_yaw.min()])
-            l_yaw_max = max([_neg_yaw.max(), _cam_yaw.max()])
+            _vio_yaw = np.array(self.vio_yaw_list)
+            l_yaw_min = min([_neg_yaw.min(), _cam_yaw.min(), _vio_yaw.min()])
+            l_yaw_max = max([_neg_yaw.max(), _cam_yaw.max(), _vio_yaw.max()])
 
-            l_yaw_min,l_yaw_max =  return_rated_minmax(l_yaw_min, l_yaw_max)
+            l_yaw_min, l_yaw_max = return_rated_minmax(l_yaw_min, l_yaw_max)
 
             self.setUIVal("Graph1D_DistYaw", [
                 (x, _neg_yaw,  ['l', l_yaw_min, l_yaw_max], "odom_yaw", "r"),
-                (x, _cam_yaw,  ['l', l_yaw_min, l_yaw_max], "cam_yaw", "g"),
+                (x, _cam_yaw,  ['l', l_yaw_min, l_yaw_max], "imu_yaw", "g"),
+                (x, _vio_yaw,  ['l', l_yaw_min, l_yaw_max], "vio_yaw", "b"),
             ])
             self.set_ui_val("odom_yaw", f"{self.odom_yaw[-1]:.1f}")
 
@@ -345,6 +368,8 @@ class Window(QWidget, UIBase):
             else:
                 self.enc_val_reset()
 
+        self._prev_moving = is_moving
+
     # ── serial send helpers ────────────────────────────────────
     def _send(self, raw_str):
         self.ros_node.send_serial(raw_str)
@@ -367,9 +392,13 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.enc_val_reset()
         self.update_odometry = False
+        stop_vio()
 
     def MoveFoward(self):
         self.MotCancel()
+        reset_img_proc_odometry()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("MOVE")
         time.sleep(0.25)
         spd  = self.getUIVal("MVSpd")[0]
         dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
@@ -379,6 +408,9 @@ class Window(QWidget, UIBase):
 
     def MoveBackward(self):
         self.MotCancel()
+        reset_img_proc_odometry()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("MOVE")
         time.sleep(0.25)
         spd  = self.getUIVal("MVSpd")[0]
         dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
@@ -388,6 +420,9 @@ class Window(QWidget, UIBase):
 
     def RotateLeft(self):
         self.MotCancel()
+        reset_img_proc_odometry()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("ROT")
         time.sleep(0.25)
         spd  = self.getUIVal("RotSpd")[0]
         dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)
@@ -397,6 +432,9 @@ class Window(QWidget, UIBase):
 
     def RotateRight(self):
         self.MotCancel()
+        reset_img_proc_odometry()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("ROT")
         time.sleep(0.25)
         spd  = self.getUIVal("RotSpd")[0]
         dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)

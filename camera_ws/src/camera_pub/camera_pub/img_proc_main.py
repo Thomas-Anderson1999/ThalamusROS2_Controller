@@ -1,7 +1,6 @@
 import copy
 
 import cv2
-from torch.fx.experimental.migrate_gradual_types.constraint_generator import lt_inference_rule
 
 from camera_pub.ThalamusCV.ThalamusCV.cvContext import *
 from camera_pub.ThalamusCV.ThalamusCV.cvUtil import *
@@ -48,6 +47,30 @@ def get_text_height(text_scale):
     return text_h
 #-ui util
 
+#+Image Processing : Odometry Reset / VIO cmd
+_odometry_reset_flag = False
+_vio_cmd_type = None  # "MOVE" | "ROT" | None
+_last_vio_yaw  = 0.0
+_last_vio_dist = 0.0
+
+def reset_img_proc_odometry():
+    global _odometry_reset_flag, _last_vio_yaw, _last_vio_dist
+    _odometry_reset_flag = True
+    _last_vio_yaw  = 0.0
+    _last_vio_dist = 0.0
+
+def stop_vio():
+    global _vio_cmd_type
+    _vio_cmd_type = None
+
+def set_vio_cmd_type(cmd_type):
+    global _vio_cmd_type
+    _vio_cmd_type = cmd_type
+
+def get_last_vio_yaw():
+    return _last_vio_yaw
+#-Image Processing : Odometry Reset / VIO cmd
+
 #+vio/icp
 class VIO:
     def __init__(self, _imgsz):
@@ -58,6 +81,7 @@ class VIO:
 
     def reset(self):
         self.acc_yaw = 0
+        self._last_computed_yaw = 0
 
     def save_yaw(self, _yaw):
         self.acc_yaw = _yaw
@@ -70,10 +94,14 @@ class VIO:
     def calcul_yaw(self, base, cur):
         pnt_num = min(len(base), len(cur))
         tar_szy, tar_szx = self.target_sz
+        y_thresh = self.imgsz * 0.05
 
         yaw_val = []
         yaw_sign = []
         for _idx in range(pnt_num):
+            if abs(base[_idx][1] - cur[_idx][1]) > y_thresh:
+                continue
+
             bx = base[_idx][0] * tar_szx / self.imgsz
             by = base[_idx][1] * tar_szy / self.imgsz
             cx = cur[_idx][0] * tar_szx / self.imgsz
@@ -91,6 +119,9 @@ class VIO:
             yaw_val.append(np.arccos(dot))
             yaw_sign.append(self.get_rot_sign(vec2, vec1))
 
+        if not yaw_val:
+            return self._last_computed_yaw
+
         _yaw = np.average(np.array(yaw_val))
 
         # 부호는 다수결로 결정
@@ -98,8 +129,9 @@ class VIO:
         neg = np.count_nonzero(np.array(yaw_sign) < 0)
         _yaw_sign = 1 if pos >= neg else -1
 
-
-        return np.degrees(_yaw)*_yaw_sign + self.acc_yaw # 평균 각도
+        result = np.degrees(_yaw)*_yaw_sign + self.acc_yaw
+        self._last_computed_yaw = result
+        return result
 
     def regist_depthmap(self, depthmap):
         self.base_depthmap = copy.deepcopy(depthmap)
@@ -107,9 +139,7 @@ class VIO:
     def calcul_dist(self, base, cur, depthmap):
         depthmap_h, depthmap_w = depthmap.shape
 
-        base_sum = 0
-        cur_sum = 0
-
+        valid_diffs = []
         pnt_num = min(len(base), len(cur))
         for _idx in range(pnt_num):
             bx = int(base[_idx][0] * depthmap_w / self.imgsz)
@@ -117,17 +147,26 @@ class VIO:
             cx = int(cur[_idx][0] * depthmap_w / self.imgsz)
             cy = int(cur[_idx][1] * depthmap_h / self.imgsz)
 
-            base_sum += self.base_depthmap[by][bx]
-            cur_sum += depthmap[cy][cx]
+            b_d = self.base_depthmap[by][bx]
+            c_d = depthmap[cy][cx]
 
-        return (base_sum - cur_sum) / pnt_num / 1000
+            if b_d > 0.1 and c_d > 0.1:
+                valid_diffs.append(b_d - c_d)
+
+        if not valid_diffs:
+            return 0.0
+        return float(np.mean(valid_diffs))
 
 _vio = VIO(img_sz)
 #+vio
 
 def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars, cmd_type):
-    print("local_idx:", local_idx, local_odometry, cmd_type)
-    #self.qt_imshow("image", image)
+    global _odometry_reset_flag, _vio_cmd_type
+    if _odometry_reset_flag:
+        local_idx = 0
+        _odometry_reset_flag = False
+
+    effective_cmd = _vio_cmd_type
 
     text_scale = 0.7
     text_h = get_text_height(text_scale)
@@ -164,12 +203,14 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
             cy = int(cur_optKey[i][0][1])
             cur_list.append((cx,cy))
 
-        vio_yaw = 0
-        if cmd_type == "ROT":
-            vio_yaw = _vio.calcul_yaw(base_list, cur_list)
-        vio_dist = 0
-        if cmd_type == "MOVE":
-            vio_dist = _vio.calcul_dist(base_list, cur_list, depthmap)
+        global _last_vio_yaw, _last_vio_dist
+        if local_idx > 0:
+            if effective_cmd == "ROT":
+                _last_vio_yaw = _vio.calcul_yaw(base_list, cur_list)
+            elif effective_cmd == "MOVE":
+                _last_vio_dist = _vio.calcul_dist(base_list, cur_list, depthmap)
+        vio_yaw  = _last_vio_yaw
+        vio_dist = _last_vio_dist
 
         if lens < 4: #re-initialize
             longterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
@@ -177,7 +218,7 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
 
         # +show text
         wheel_odometry_dist = np.sqrt(local_odometry[0]**2 + local_odometry[1]**2)
-        text = f"{cmd_type}: oDist:{wheel_odometry_dist:.2f} oPos:{local_odometry[0]:.1f},{local_odometry[1]:.1f} oAtt:{local_odometry[2]:.1f}"
+        text = f"{effective_cmd}: oDist:{wheel_odometry_dist:.2f} oPos:{local_odometry[0]:.1f},{local_odometry[1]:.1f} oAtt:{local_odometry[2]:.1f}"
         cv2.putText(optRes, text, (10, img_sz - int(text_h * 3)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0), 1, cv2.LINE_AA)
         text = f"imu_yaw:{pose_ars[0]:.1f} vio_yaw:{vio_yaw:.1f}, vio_dist:{vio_dist:.2f}"
         cv2.putText(optRes, text, (10, img_sz - int(text_h * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0), 1, cv2.LINE_AA)

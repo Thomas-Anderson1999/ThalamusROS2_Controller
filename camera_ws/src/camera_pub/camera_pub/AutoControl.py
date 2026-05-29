@@ -374,6 +374,8 @@ class PresetCamWindow(QWidget, UIBase):
             self._proc_odom_timer.stop()
             print("[image_proc_odometry] 중지")
         else:
+            if not self.parent_window._streaming:
+                self.parent_window.open_streaming()
             self._proc_odom_local_idx = 0
             self._proc_odom_timer.start(50)
             print("[image_proc_odometry] 시작")
