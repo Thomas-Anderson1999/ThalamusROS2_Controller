@@ -519,6 +519,7 @@ class PresetCamWindow(QWidget, UIBase):
         cam_pan   = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
         norm_rot  = rotate_vector(norm_vec, cam_pitch, 0, odom_yaw + cam_pan)
 
+        tgt_depth_m = 0.0
         depth_src = self.get_ui_val("Depth_Src") or "Virtual_Plane"
         if depth_src == "Depth_Map":
             depth = self.parent_window.ros_node.depth_image
@@ -526,8 +527,9 @@ class PresetCamWindow(QWidget, UIBase):
                 dh, dw = depth.shape
                 dx_ = int(dw * x / img_w)
                 dy_ = int(dh * y / img_h)
-                tgt_depth_m = float(depth[dy_, dx_])
-                if np.isfinite(tgt_depth_m) and tgt_depth_m > 0:
+                _d = float(depth[dy_, dx_])
+                if np.isfinite(_d) and _d > 0:
+                    tgt_depth_m = _d
                     pnt_3d = norm_rot * tgt_depth_m * 1000.0  # m → mm
                 else:
                     pnt_3d = get_crosspnt(norm_rot)
@@ -540,13 +542,19 @@ class PresetCamWindow(QWidget, UIBase):
         self.set_ui_val("TgtPosY", f"{pnt_3d[1] / 1000:.3f}")
         self.set_ui_val("TgtPosZ", f"{odom_x + pnt_3d[0] / 1000:.3f}")
 
-        veh_dist = float(min(np.sqrt(pnt_3d[0]**2 + pnt_3d[2]**2), 2500))
+        if tgt_depth_m > 0:
+            ny = norm_vec[1]
+            horiz_m = np.sqrt(max(tgt_depth_m**2 - (ny * tgt_depth_m)**2, 0))
+            veh_dist = float(min(horiz_m * 1000, 3000))
+        else:
+            cam_pnt = get_crosspnt(norm_vec)  # camera frame, 0,0,0 기준
+            veh_dist = float(min(np.sqrt(cam_pnt[0]**2 + cam_pnt[2]**2), 3000))
         self.set_ui_val("TgtDist", f"{int(veh_dist)}")
 
         bearing_deg = int(pan_angle - (self.get_ui_val("N", int) or 0) + (self.get_ui_val("PanningAngle", int) or 0))
         self.set_ui_val("TgtBearing", f"{bearing_deg}")
 
-        # ── Ctrl+클릭: SeqCmd 자동 생성 ────────────────────────
+        # ── Ctrl+클릭: SeqCmd 자동 생성 + 마커 표시 ───────────
         if QApplication.keyboardModifiers() & Qt.ControlModifier:
             self.parent_window.sequential_cmd_list = []
             if abs(bearing_deg) > 1:
@@ -557,3 +565,21 @@ class PresetCamWindow(QWidget, UIBase):
                 spd = self.getUIVal("MVSpd")[0]
                 self.parent_window.sequential_cmd_list.append(f"MV_FWD {spd} {int(veh_dist)}")
             self.setUIVal("SeqCmd", self.parent_window.sequential_cmd_list)
+            sw = getattr(self.parent_window, '_streaming_window', None)
+            if sw is not None:
+                depth_img = self.parent_window.ros_node.depth_image
+                marker_text = "depth N/A"
+                if depth_img is not None:
+                    dh, dw = depth_img.shape
+                    ddx = max(0, min(int(x * dw / img_w), dw - 1))
+                    ddy = max(0, min(int(y * dh / img_h), dh - 1))
+                    r = 2
+                    patch = depth_img[max(0, ddy-r):ddy+r+1, max(0, ddx-r):ddx+r+1]
+                    valid = patch[np.isfinite(patch) & (patch > 0)]
+                    if valid.size > 0:
+                        depth_m = float(np.median(valid))
+                        pos = norm_vec * depth_m
+                        marker_text = f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}, {depth_m:.1f})"
+                    else:
+                        marker_text = "depth 0"
+                sw.set_marker(x, y, marker_text)

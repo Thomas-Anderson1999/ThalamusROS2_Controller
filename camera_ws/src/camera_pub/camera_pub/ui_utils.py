@@ -55,6 +55,8 @@ class StreamingWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Camera Streaming")
+        self._marker_pos  = None   # (x, y) image coords
+        self._marker_text = ""
         layout = QHBoxLayout()
         self.rgb_label   = ClickableLabel("camera")
         self.depth_label = ClickableLabel("depth")
@@ -66,6 +68,11 @@ class StreamingWindow(QWidget):
         self.setLayout(layout)
         self.resize(1280, 480)
 
+    def set_marker(self, x, y, text):
+        self._marker_pos  = (x, y)
+        self._marker_text = text
+        print(f"[marker] {text}")
+
     def set_click_cb(self, cb):
         self.rgb_label.set_click_cb(cb)
         self.depth_label.set_click_cb(cb)
@@ -75,6 +82,15 @@ class StreamingWindow(QWidget):
         self.depth_label.set_dblclick_cb(cb)
 
     def update_rgb(self, img_bgr):
+        if self._marker_pos is not None:
+            img_bgr = img_bgr.copy()
+            mx, my = self._marker_pos
+            r = 14
+            cv2.circle(img_bgr, (mx, my), r, (0, 255, 255), 2)
+            cv2.line(img_bgr, (mx - r, my), (mx + r, my), (0, 255, 255), 1)
+            cv2.line(img_bgr, (mx, my - r), (mx, my + r), (0, 255, 255), 1)
+            cv2.putText(img_bgr, self._marker_text, (mx + r + 4, my),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w, c = img.shape
         qimg = QImage(img.data, w, h, w * c, QImage.Format_RGB888)
