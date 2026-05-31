@@ -114,6 +114,9 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.COMBO,  _caption="CamTrackMode", _default_val=["None", "fix_cam_rotation", "fix_on_target"]),
             UIElement(_type=UIElementType.BUTTON, _caption="excute_first_action", _default_val=self.excute_first_action),
+            UIElement(_type=UIElementType.EDIT,   _caption="local_pos",      _default_val="0,0,0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="local_cam_pose", _default_val="0,0,0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="init_local",     _default_val=self.init_local),
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.LISTBOX, _caption="SeqCmd", _default_val=None, _defalt_row=3, _defalt_culumn=8),
@@ -425,6 +428,13 @@ class PresetCamWindow(QWidget, UIBase):
         pan = (self.get_ui_val("PanningAngle", float) or 0.0) + (self.get_ui_val("TgtPan", float) or 0.0)
         self.set_ui_val("PanningAngle", str(int(pan)))
         self.parent_window.SetPanning()
+
+    def init_local(self):
+        self.set_ui_val("local_pos", "0,0,0")
+        pitch = self.parent_window.get_ui_val("camera_pitch") or "0"
+        roll  = self.parent_window.get_ui_val("camera_roll")  or "0"
+        pan   = self.parent_window.get_ui_val("PanningAngle") or "0"
+        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{pan}")
 
     def excute_first_action(self):
         if not self.parent_window.sequential_cmd_list:
