@@ -242,6 +242,8 @@ class Window(QWidget, UIBase):
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
         if self._streaming:
+            if self._preset_cam_win is not None:
+                self._preset_cam_win.update_marker()  # 마커 픽셀 위치 갱신 (update_rgb 전)
             rgb = self.ros_node.rgb_image
             depth = self.ros_node.depth_image
             if rgb is not None:

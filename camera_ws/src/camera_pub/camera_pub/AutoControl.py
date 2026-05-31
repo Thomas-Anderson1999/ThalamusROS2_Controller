@@ -17,7 +17,7 @@ from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
-from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D
+from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D, Convert3DtoPixel
 
 
 meter_per_enc = 11600
@@ -457,6 +457,71 @@ class PresetCamWindow(QWidget, UIBase):
         yaw   = odom_yaw - self._local_ref_yaw + (float(pan) - float(n))
         self.set_ui_val("local_cam_pose", f"{pitch},{roll},{yaw:.1f}")
 
+    def update_marker(self):
+        """매 프레임 호출: 클릭 시점 cam_pos를 local_yaw만큼 역회전해 현재 픽셀로 재투영"""
+        if not hasattr(self, '_marker_cam_pos') or self._marker_cam_pos is None:
+            return
+        sw = getattr(self.parent_window, '_streaming_window', None)
+        if sw is None:
+            return
+        if not _init_thalamus():
+            return
+
+        # local_cam_pose = "pitch,roll,yaw"
+        # yaw = 클릭 이후 카메라 전체 회전량
+        #     = (odom_yaw - ref_yaw) + (PanningAngle - N)
+        local_cam_pose = self.get_ui_val("local_cam_pose") or "0,0,0"
+        vals = [s.strip() for s in local_cam_pose.split(",")]
+        try:
+            local_yaw = float(vals[2]) if len(vals) >= 3 else 0.0
+        except ValueError:
+            local_yaw = 0.0
+
+        # ── [C'] 역병진: 차량 이동분을 클릭 시점 카메라 프레임으로 변환 후 차감 ─
+        # local_pos = "dx,dy,0" (odom 좌표, 단위: m)
+        # ref_yaw 기준으로 odom(dx,dy) → 카메라 프레임(X=우, Z=전방)으로 투영
+        local_pos_str = self.get_ui_val("local_pos") or "0,0,0"
+        pvals = [s.strip() for s in local_pos_str.split(",")]
+        try:
+            dx = float(pvals[0]) if len(pvals) >= 1 else 0.0
+            dy = float(pvals[1]) if len(pvals) >= 2 else 0.0
+        except ValueError:
+            dx, dy = 0.0, 0.0
+
+        ref_rad  = np.deg2rad(getattr(self, '_local_ref_yaw', 0.0))
+        veh_cam_z = dx * np.cos(ref_rad) + dy * np.sin(ref_rad)   # 전방(Z)
+        veh_cam_x = dx * np.sin(ref_rad) - dy * np.cos(ref_rad)   # 우(X)
+        vehicle_cam = np.array([veh_cam_x, 0.0, veh_cam_z])
+
+        cam_pos_adjusted = self._marker_cam_pos - vehicle_cam
+
+        # ── [B'] 역회전: local_yaw만큼 Ry(local_yaw) 적용 ───────────────
+        _y = np.deg2rad(local_yaw)
+        Ry_mat = np.array([[ np.cos(_y), 0, np.sin(_y)],
+                           [0,           1, 0          ],
+                           [-np.sin(_y), 0, np.cos(_y)]])
+        cam_pos_now = Ry_mat @ cam_pos_adjusted
+
+        # ── [A'] 3D (camera frame) → pixel ───────────────────────────────
+        if cam_pos_now[2] <= 0:
+            return
+        try:
+            px_1280, py_720 = Convert3DtoPixel(
+                float(cam_pos_now[0]), float(cam_pos_now[1]), float(cam_pos_now[2]))
+        except Exception as e:
+            print(f"[update_marker] Convert3DtoPixel error: {e}")
+            return
+
+        pw = self.parent_window
+        rgb = pw.ros_node.rgb_image
+        if rgb is None:
+            return
+        img_h, img_w = rgb.shape[:2]
+        px = int(px_1280 * img_w / 1280)
+        py = int(py_720  * img_h / 720)
+        if 0 <= px < img_w and 0 <= py < img_h:
+            sw.set_marker(px, py, self._marker_cam_text)
+
     def excute_first_action(self):
         if not self.parent_window.sequential_cmd_list:
             return
@@ -601,6 +666,8 @@ class PresetCamWindow(QWidget, UIBase):
             if sw is not None:
                 depth_img = self.parent_window.ros_node.depth_image
                 marker_text = "depth N/A"
+                self._marker_local_pos  = None
+                self._marker_local_text = None
                 if depth_img is not None:
                     dh, dw = depth_img.shape
                     ddx = max(0, min(int(x * dw / img_w), dw - 1))
@@ -610,10 +677,17 @@ class PresetCamWindow(QWidget, UIBase):
                     valid = patch[np.isfinite(patch) & (patch > 0)]
                     if valid.size > 0:
                         depth_m = float(np.median(valid))
-                        cam_pitch = self.get_ui_val("camera_pitch", float) or 0.0
-                        cam_pan   = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
-                        pos = rotate_vector(norm_vec, cam_pitch, 0, cam_pan) * depth_m
-                        marker_text = f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}, {depth_m:.1f})"
+
+                        # ── [A] pixel → 3D (camera frame, 클릭 시점) ──────
+                        # cam_pos: 카메라 프레임 기준 3D 위치 (단위: m)
+                        cam_pos = norm_vec * depth_m
+
+                        # ── 저장: 클릭 시점 카메라 프레임 벡터 그대로 보관 ─
+                        # 재투영은 update_marker에서 local_cam_pose yaw로 처리
+                        self._marker_cam_pos  = cam_pos.copy()
+                        self._marker_cam_text = f"({cam_pos[0]:.1f},{cam_pos[1]:.1f},{cam_pos[2]:.1f},{depth_m:.1f})"
+                        marker_text = self._marker_cam_text
                     else:
                         marker_text = "depth 0"
+                        self._marker_cam_pos  = None
                 sw.set_marker(x, y, marker_text)
