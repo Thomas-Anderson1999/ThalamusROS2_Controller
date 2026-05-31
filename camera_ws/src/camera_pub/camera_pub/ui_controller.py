@@ -365,6 +365,9 @@ class Window(QWidget, UIBase):
                 self.set_ui_val("odometry_Y",      f"{self.odom_y[-1]:.3f}")
                 self.set_ui_val("odometry_Yaw",    f"{self.odom_yaw[-1]:.3f}")
                 self.set_ui_val("local_action_yaw", f"{int(self.local_yaw)}")
+                if self._preset_cam_win is not None:
+                    self._preset_cam_win.update_local(
+                        self.odom_x[-1], self.odom_y[-1], self.odom_yaw[-1])
             else:
                 self.enc_val_reset()
 

@@ -1,4 +1,7 @@
 {"x": 0, "y": 1080, "width": 1000, "height": 1000}
-{"SendStr": "", "TiltAngle": "45", "PanningAngle": "0", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "90"}
-{"camera_roll": "-1.5", "camera_pitch": "-2.7", "camera_yaw": "-35.6", "enc1": "0", "enc2": "0", "spd1": "0", "spd2": "0", "stat1": "0", "stat2": "0"}
+{"SendStr": "SV 1 1440", "TiltAngle": "20", "PanningAngle": "8", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "90"}
+{"camera_roll": "1.0", "camera_pitch": "-2.1", "camera_yaw": "-77.9", "odom_yaw": "0", "enc1": "0", "enc2": "0", "spd1": "0", "spd2": "0", "stat1": "0", "stat2": "0"}
 {}
+{"LLL": "-127", "LL": "-82", "L": "-37", "N": "8", "R": "53", "RR": "98", "RRR": "135", "UP": "0", "MD": "20", "DN": "65"}
+{"ClickPosX": "344", "ClickPosY": "385", "TgtPan": "-3", "TgtTilt": "33", "odometry_X": "0", "odometry_Y": "0", "odometry_Yaw": "0", "local_action_yaw": "0", "Depth_Src": "Depth_Map", "TgtPosX": "-0.154", "TgtPosY": "0.700", "TgtPosZ": "2.007", "TgtBearing": "4", "TgtDist": "2278", "CamTrackMode": "None", "local_pos": "0,0,0", "local_cam_pose": "-2.1,1.1,0.0"}
+{"conf": "0.25", "iou": "0.5", "dist_th": "50.0", "close_iter": "3", "forced_px": "128,230", "normal_th": "0.7", "gmap_ox": "0", "gmap_oy": "0", "scale_per1pix": "20"}

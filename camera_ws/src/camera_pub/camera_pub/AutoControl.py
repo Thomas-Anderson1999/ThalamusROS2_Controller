@@ -430,11 +430,32 @@ class PresetCamWindow(QWidget, UIBase):
         self.parent_window.SetPanning()
 
     def init_local(self):
+        pw = self.parent_window
+        self._local_ref_x   = pw.odom_x[-1]   if pw.odom_x   else 0.0
+        self._local_ref_y   = pw.odom_y[-1]   if pw.odom_y   else 0.0
+        self._local_ref_yaw = pw.odom_yaw[-1] if pw.odom_yaw else 0.0
         self.set_ui_val("local_pos", "0,0,0")
-        pitch = self.parent_window.get_ui_val("camera_pitch") or "0"
-        roll  = self.parent_window.get_ui_val("camera_roll")  or "0"
-        pan   = self.parent_window.get_ui_val("PanningAngle") or "0"
-        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{pan}")
+        pitch = pw.get_ui_val("camera_pitch") or "0"
+        roll  = pw.get_ui_val("camera_roll")  or "0"
+        pan   = pw.get_ui_val("PanningAngle") or "0"
+        n     = pw.get_ui_val("N") or "0"
+        yaw   = pw.odom_yaw[-1] - self._local_ref_yaw + (float(pan) - float(n))
+        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{yaw:.1f}")
+
+    def update_local(self, odom_x, odom_y, odom_yaw):
+        if not hasattr(self, '_local_ref_x') or self._local_ref_x is None:
+            return
+        dx = odom_x - self._local_ref_x
+        dy = odom_y - self._local_ref_y
+        dz = 0.0
+        self.set_ui_val("local_pos", f"{dx:.3f},{dy:.3f},{dz:.3f}")
+        pw    = self.parent_window
+        pitch = pw.get_ui_val("camera_pitch") or "0"
+        roll  = pw.get_ui_val("camera_roll")  or "0"
+        pan   = pw.get_ui_val("PanningAngle") or "0"
+        n     = pw.get_ui_val("N") or "0"
+        yaw   = odom_yaw - self._local_ref_yaw + (float(pan) - float(n))
+        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{yaw:.1f}")
 
     def excute_first_action(self):
         if not self.parent_window.sequential_cmd_list:
@@ -566,6 +587,7 @@ class PresetCamWindow(QWidget, UIBase):
 
         # ── Ctrl+클릭: SeqCmd 자동 생성 + 마커 표시 ───────────
         if QApplication.keyboardModifiers() & Qt.ControlModifier:
+            self.init_local()
             self.parent_window.sequential_cmd_list = []
             if abs(bearing_deg) > 1:
                 spd = self.getUIVal("RotSpd")[0]
@@ -588,7 +610,9 @@ class PresetCamWindow(QWidget, UIBase):
                     valid = patch[np.isfinite(patch) & (patch > 0)]
                     if valid.size > 0:
                         depth_m = float(np.median(valid))
-                        pos = norm_vec * depth_m
+                        cam_pitch = self.get_ui_val("camera_pitch", float) or 0.0
+                        cam_pan   = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
+                        pos = rotate_vector(norm_vec, cam_pitch, 0, cam_pan) * depth_m
                         marker_text = f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}, {depth_m:.1f})"
                     else:
                         marker_text = "depth 0"
