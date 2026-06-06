@@ -7,3 +7,5 @@ camera_ws/build
 camera_ws/log
 camera_ws/install
 .idea/
+__pycache__/
+*.pyc

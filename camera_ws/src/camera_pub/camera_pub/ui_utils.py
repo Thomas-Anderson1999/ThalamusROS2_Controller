@@ -55,8 +55,10 @@ class StreamingWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Camera Streaming")
-        self._marker_pos  = None   # (x, y) image coords
+        self._marker_pos  = None   # (x, y) image coords  — yellow
         self._marker_text = ""
+        self._marker2_pos  = None  # (x, y) image coords  — green (optflow)
+        self._marker2_text = ""
         layout = QHBoxLayout()
         self.rgb_label   = ClickableLabel("camera")
         self.depth_label = ClickableLabel("depth")
@@ -73,6 +75,18 @@ class StreamingWindow(QWidget):
         self._marker_text = text
         print(f"[marker] {text}")
 
+    def clear_marker(self):
+        self._marker_pos  = None
+        self._marker_text = ""
+
+    def set_marker2(self, x, y, text):
+        if text:
+            self._marker2_pos  = (x, y)
+            self._marker2_text = text
+        else:
+            self._marker2_pos  = None
+            self._marker2_text = ""
+
     def set_click_cb(self, cb):
         self.rgb_label.set_click_cb(cb)
         self.depth_label.set_click_cb(cb)
@@ -82,8 +96,9 @@ class StreamingWindow(QWidget):
         self.depth_label.set_dblclick_cb(cb)
 
     def update_rgb(self, img_bgr):
-        if self._marker_pos is not None:
+        if self._marker_pos is not None or self._marker2_pos is not None:
             img_bgr = img_bgr.copy()
+        if self._marker_pos is not None:
             mx, my = self._marker_pos
             r = 14
             cv2.circle(img_bgr, (mx, my), r, (0, 255, 255), 2)
@@ -91,6 +106,14 @@ class StreamingWindow(QWidget):
             cv2.line(img_bgr, (mx, my - r), (mx, my + r), (0, 255, 255), 1)
             cv2.putText(img_bgr, self._marker_text, (mx + r + 4, my),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        if self._marker2_pos is not None:
+            mx2, my2 = self._marker2_pos
+            r2 = 10
+            cv2.circle(img_bgr, (mx2, my2), r2, (0, 255, 0), 2)
+            cv2.line(img_bgr, (mx2 - r2, my2), (mx2 + r2, my2), (0, 255, 0), 1)
+            cv2.line(img_bgr, (mx2, my2 - r2), (mx2, my2 + r2), (0, 255, 0), 1)
+            cv2.putText(img_bgr, self._marker2_text, (mx2 + r2 + 4, my2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w, c = img.shape
         qimg = QImage(img.data, w, h, w * c, QImage.Format_RGB888)

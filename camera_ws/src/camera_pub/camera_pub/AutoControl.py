@@ -12,7 +12,7 @@ _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt, QTimer
-from camera_pub.img_proc_main import img_proc_odometry
+from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts
 from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
 
@@ -22,6 +22,8 @@ from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3
 
 meter_per_enc = 11600
 rotate_pi_per_enc = 4819
+TRACK_MAX_PAN_STEP_DEG = 3.0
+TRACK_MAX_TILT_STEP_DEG = 3.0
 
 _ASM_FILE = "ScriptFreeModel.txt".encode("UTF-8")
 _thalamus_ready = False
@@ -104,7 +106,7 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT, _caption="local_action_yaw", _default_val="0"),
 
             UIElement(_type=UIElementType.NEW_LINE),
-            UIElement(_type=UIElementType.COMBO, _caption="Depth_Src", _default_val=["Virtual_Plane", "Depth_Map"]),
+            UIElement(_type=UIElementType.COMBO, _caption="Depth_Src", _default_val=["Depth_Map", "Virtual_Plane"]),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosX", _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosY", _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosZ", _default_val="0"),
@@ -424,7 +426,7 @@ class PresetCamWindow(QWidget, UIBase):
     def set_clicked_pos(self):
         self.set_ui_val("TiltAngle", self.get_ui_val("TgtTilt"))
         self.parent_window.SetTilt()
-        time.sleep(0.2)
+
         pan = (self.get_ui_val("PanningAngle", float) or 0.0) + (self.get_ui_val("TgtPan", float) or 0.0)
         self.set_ui_val("PanningAngle", str(int(pan)))
         self.parent_window.SetPanning()
@@ -434,31 +436,42 @@ class PresetCamWindow(QWidget, UIBase):
         self._local_ref_x   = pw.odom_x[-1]   if pw.odom_x   else 0.0
         self._local_ref_y   = pw.odom_y[-1]   if pw.odom_y   else 0.0
         self._local_ref_yaw = pw.odom_yaw[-1] if pw.odom_yaw else 0.0
+        # Ctrl+click 시점 카메라 기준값 저장(이후에는 현재값-기준값 델타만 사용)
+        # UI edit 값이 아닌 attitude 원본값을 사용해 수동 입력 영향 제거
+        att = pw.ros_node.attitude
+        self._local_ref_cam_yaw = float(att.z) if att is not None else 0.0
+        self._local_ref_pitch = float(att.y) if att is not None else 0.0
+        self._local_ref_roll  = float(att.x) if att is not None else 0.0
         self.set_ui_val("local_pos", "0,0,0")
-        pitch = pw.get_ui_val("camera_pitch") or "0"
-        roll  = pw.get_ui_val("camera_roll")  or "0"
-        pan   = pw.get_ui_val("PanningAngle") or "0"
-        n     = pw.get_ui_val("N") or "0"
-        yaw   = pw.odom_yaw[-1] - self._local_ref_yaw + (float(pan) - float(n))
-        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{yaw:.1f}")
+        self.set_ui_val("local_cam_pose", "0.0,0.0,0.0")
 
     def update_local(self, odom_x, odom_y, odom_yaw):
         if not hasattr(self, '_local_ref_x') or self._local_ref_x is None:
             return
         dx = odom_x - self._local_ref_x
         dy = odom_y - self._local_ref_y
-        dz = 0.0
-        self.set_ui_val("local_pos", f"{dx:.3f},{dy:.3f},{dz:.3f}")
+        self.set_ui_val("local_pos", f"{dx:.3f},{dy:.3f},0.0")
         pw    = self.parent_window
-        pitch = pw.get_ui_val("camera_pitch") or "0"
-        roll  = pw.get_ui_val("camera_roll")  or "0"
-        pan   = pw.get_ui_val("PanningAngle") or "0"
-        n     = pw.get_ui_val("N") or "0"
-        yaw   = odom_yaw - self._local_ref_yaw + (float(pan) - float(n))
-        self.set_ui_val("local_cam_pose", f"{pitch},{roll},{yaw:.1f}")
+        att = pw.ros_node.attitude
+        pitch = float(att.y) if att is not None else 0.0
+        roll  = float(att.x) if att is not None else 0.0
+        cam_yaw = float(att.z) if att is not None else 0.0
+        ref_cam_yaw = getattr(self, '_local_ref_cam_yaw', cam_yaw)
+        ref_pitch = getattr(self, '_local_ref_pitch', pitch)
+        ref_roll  = getattr(self, '_local_ref_roll', roll)
+        # yaw는 실제 카메라 yaw 피드백의 변화량으로 계산
+        yaw = cam_yaw - ref_cam_yaw
+        pitch_delta = pitch - ref_pitch
+        roll_delta = roll - ref_roll
+        self.set_ui_val("local_cam_pose", f"{pitch_delta:.1f},{roll_delta:.1f},{yaw:.1f}")
 
     def update_marker(self):
-        """매 프레임 호출: 클릭 시점 cam_pos를 local_yaw만큼 역회전해 현재 픽셀로 재투영"""
+        """매 프레임 마커를 갱신한다.
+
+        1) 클릭 시 저장한 3D 카메라 좌표를 기준으로 차량 이동/회전을 역보정
+        2) 보정된 3D 좌표를 현재 영상 픽셀로 재투영해 빨간 마커 표시
+        3) optflow로 초록 마커를 추적하고 pan/tilt 목표를 갱신
+        """
         if not hasattr(self, '_marker_cam_pos') or self._marker_cam_pos is None:
             return
         sw = getattr(self.parent_window, '_streaming_window', None)
@@ -467,19 +480,29 @@ class PresetCamWindow(QWidget, UIBase):
         if not _init_thalamus():
             return
 
-        # local_cam_pose = "pitch,roll,yaw"
-        # yaw = 클릭 이후 카메라 전체 회전량
-        #     = (odom_yaw - ref_yaw) + (PanningAngle - N)
+        # 최신 odom + pan 상태를 local 상태값(local_pos/local_cam_pose)에 반영
+        pw = self.parent_window
+        self.update_local(
+            pw.odom_x[-1]   if pw.odom_x   else 0.0,
+            pw.odom_y[-1]   if pw.odom_y   else 0.0,
+            pw.odom_yaw[-1] if pw.odom_yaw else 0.0,
+        )
+
+        # local_cam_pose 형식: "pitch_delta,roll_delta,yaw_delta" (deg)
         local_cam_pose = self.get_ui_val("local_cam_pose") or "0,0,0"
         vals = [s.strip() for s in local_cam_pose.split(",")]
         try:
+            local_pitch = float(vals[0]) if len(vals) >= 1 else 0.0
+            local_roll = float(vals[1]) if len(vals) >= 2 else 0.0
             local_yaw = float(vals[2]) if len(vals) >= 3 else 0.0
         except ValueError:
+            local_pitch = 0.0
+            local_roll = 0.0
             local_yaw = 0.0
 
-        # ── [C'] 역병진: 차량 이동분을 클릭 시점 카메라 프레임으로 변환 후 차감 ─
-        # local_pos = "dx,dy,0" (odom 좌표, 단위: m)
-        # ref_yaw 기준으로 odom(dx,dy) → 카메라 프레임(X=우, Z=전방)으로 투영
+        # local_pos 형식: "dx,dy,0" (odom 기준 이동량, m)
+        # ref_yaw 기준으로 odom 이동량(dx,dy)을 카메라 프레임(X=우, Z=전방)으로 변환
+        # 변환된 차량 이동량을 marker 3D 좌표에서 빼서 역병진 적용
         local_pos_str = self.get_ui_val("local_pos") or "0,0,0"
         pvals = [s.strip() for s in local_pos_str.split(",")]
         try:
@@ -495,32 +518,101 @@ class PresetCamWindow(QWidget, UIBase):
 
         cam_pos_adjusted = self._marker_cam_pos - vehicle_cam
 
-        # ── [B'] 역회전: local_yaw만큼 Ry(local_yaw) 적용 ───────────────
-        _y = np.deg2rad(local_yaw)
-        Ry_mat = np.array([[ np.cos(_y), 0, np.sin(_y)],
-                           [0,           1, 0          ],
-                           [-np.sin(_y), 0, np.cos(_y)]])
-        cam_pos_now = Ry_mat @ cam_pos_adjusted
+        # 클릭 시점 대비 카메라 자세 변화량을 역회전으로 보정
+        # 현재는 안정화를 위해 yaw/pitch만 반영(roll 보정 제외)
+        px = -np.deg2rad(local_pitch)
+        ry = -np.deg2rad(local_yaw)
+        Rx = np.array([[1, 0, 0],
+                       [0, np.cos(px), -np.sin(px)],
+                       [0, np.sin(px),  np.cos(px)]])
+        Ry = np.array([[ np.cos(ry), 0, np.sin(ry)],
+                       [0,           1, 0         ],
+                       [-np.sin(ry), 0, np.cos(ry)]])
+        cam_pos_now = (Ry @ Rx) @ cam_pos_adjusted
 
-        # ── [A'] 3D (camera frame) → pixel ───────────────────────────────
+        # 보정된 3D 카메라 좌표를 현재 영상 픽셀로 투영
+        pw = self.parent_window
+        rgb = pw.ros_node.rgb_image
+        if rgb is None:
+            return
+        img_h, img_w = rgb.shape[:2]
+
         if cam_pos_now[2] <= 0:
+            sw.clear_marker()
             return
         try:
             px_1280, py_720 = Convert3DtoPixel(
                 float(cam_pos_now[0]), float(cam_pos_now[1]), float(cam_pos_now[2]))
         except Exception as e:
             print(f"[update_marker] Convert3DtoPixel error: {e}")
+            sw.clear_marker()
             return
 
-        pw = self.parent_window
-        rgb = pw.ros_node.rgb_image
-        if rgb is None:
-            return
-        img_h, img_w = rgb.shape[:2]
         px = int(px_1280 * img_w / 1280)
         py = int(py_720  * img_h / 720)
         if 0 <= px < img_w and 0 <= py < img_h:
             sw.set_marker(px, py, self._marker_cam_text)
+        else:
+            sw.clear_marker()
+
+        # 초록 마커: optflow 점 중 이전 마커 위치와 가장 가까운 점으로 추적
+        if not hasattr(self, '_marker_flow_512_pos') or self._marker_flow_512_pos is None:
+            return
+        optflow_pts = get_last_optflow_pts()
+        if not optflow_pts:
+            return
+        fx, fy = self._marker_flow_512_pos
+        best_pt = min(optflow_pts,
+                      key=lambda pt: (pt[0] - fx)**2 + (pt[1] - fy)**2)
+        self._marker_flow_512_pos = list(best_pt)   # 다음 프레임 기준점 갱신
+        cx_512, cy_512 = best_pt
+        flow_px = int(cx_512 * img_w / 512)
+        flow_py = int(cy_512 * img_h / 512)
+        if not (0 <= flow_px < img_w and 0 <= flow_py < img_h):
+            return
+        sw.set_marker2(flow_px, flow_py, self._marker_flow_cam_text)
+
+        # 초록 마커를 화면 중앙으로 유도하기 위한 pan/tilt 목표 계산
+        # 명령 충돌을 줄이기 위해 틱 기반으로 tilt/pan을 교대로 전송
+        _TRACK_N    = 5    # 명령 스케줄 주기
+        _TILT_TICK  = 1    # tilt 전송 틱
+        _PAN_TICK   = 3    # pan 전송 틱
+
+        self.set_ui_val("ClickPosX", str(flow_px))
+        self.set_ui_val("ClickPosY", str(flow_py))
+
+        flow_tx = int(flow_px * 1280 / img_w)
+        flow_ty = int(flow_py * 720  / img_h)
+        try:
+            fnorm = np.array(Pixelto3D(flow_tx, flow_ty, 1))
+        except Exception:
+            return
+        fnx, fny, fnz = fnorm
+        pan_angle    = np.degrees(np.arctan2(fnx, fnz))
+        tilt_deg     = np.degrees(np.arctan2(-fny, np.sqrt(fnx*fnx + fnz*fnz)))
+        current_tilt = self.get_ui_val("camera_pitch", float) or 0.0
+        tilt_servo   = get_tilt_servo_angle(current_tilt + tilt_deg)
+        pan_servo    = int(pan_angle - (self.get_ui_val("N", int) or 0))
+
+        pan_step = float(np.clip(pan_servo, -TRACK_MAX_PAN_STEP_DEG, TRACK_MAX_PAN_STEP_DEG))
+        cur_tilt_servo = float(self.get_ui_val("TiltAngle", float) or 0.0)
+        tilt_delta = float(tilt_servo) - cur_tilt_servo
+        tilt_step = float(np.clip(tilt_delta, -TRACK_MAX_TILT_STEP_DEG, TRACK_MAX_TILT_STEP_DEG))
+        next_tilt_servo = int(np.clip(cur_tilt_servo + tilt_step, 0.0, 90.0))
+
+        self.set_ui_val("TgtPan",  str(int(pan_step)))
+        self.set_ui_val("TgtTilt", str(next_tilt_servo))
+
+        tick = getattr(self, '_track_tick', 0)
+        self._track_tick = (tick + 1) % _TRACK_N
+
+        if tick == _TILT_TICK:
+            self.set_ui_val("TiltAngle", str(next_tilt_servo))
+            pw.SetTilt()
+        elif tick == _PAN_TICK:
+            new_pan = (self.get_ui_val("PanningAngle", float) or 0.0) + pan_step
+            self.set_ui_val("PanningAngle", str(int(new_pan)))
+            pw.SetPanning()
 
     def excute_first_action(self):
         if not self.parent_window.sequential_cmd_list:
@@ -553,13 +645,18 @@ class PresetCamWindow(QWidget, UIBase):
         if selected:
             self.set_ui_val("SendStr", selected[0])
 
-    # ── image click handler ────────────────────────────────────
     def _on_image_click(self, name, x, y):
+        """영상 클릭 이벤트를 처리한다.
+
+        1) 클릭 픽셀을 카메라 방향벡터로 변환하고 pan/tilt 목표 계산
+        2) depth(또는 가상 평면) 기반으로 목표 3D 좌표/거리/방위각 계산
+        3) Ctrl+클릭이면 주행 시퀀스와 추적 마커(노랑/초록) 초기화
+        """
         self.set_ui_val("ClickPosX", str(x))
         self.set_ui_val("ClickPosY", str(y))
         print(f"[click] name={name} x={x} y={y}")
 
-        # ── TgtPan / TgtTilt 계산 ──────────────────────────────
+        # 클릭 픽셀(x,y)을 내부 기준 해상도(1280x720)로 변환
         rgb = self.parent_window.ros_node.rgb_image
         if rgb is None:
             print("[click] rgb is None, skip")
@@ -573,6 +670,7 @@ class PresetCamWindow(QWidget, UIBase):
             print("[click] thalamus not ready")
             return
         try:
+            # Pixelto3D: 왜곡 보정된 카메라 단위 방향벡터 (X=우, Y=하, Z=전방)
             norm_vec = np.array(Pixelto3D(tx, ty, 1))
             print(f"[click] norm_vec={norm_vec}")
         except Exception as e:
@@ -581,6 +679,7 @@ class PresetCamWindow(QWidget, UIBase):
 
         nx, ny, nz = tuple(norm_vec)
 
+        # 클릭 지점을 중앙으로 맞추기 위한 상대 pan/tilt 보정각 계산
         pan_angle  = np.degrees(np.arctan2(nx, nz))
         tilt_deg   = np.degrees(np.arctan2(-ny, np.sqrt(nx*nx + nz*nz)))
 
@@ -592,7 +691,7 @@ class PresetCamWindow(QWidget, UIBase):
         self.set_ui_val("TgtPan",  str(pan_servo))
         self.set_ui_val("TgtTilt", str(tilt_servo))
 
-        # ── TgtPos / TgtDist / TgtBearing 계산 ────────────────
+        # 클릭 방향벡터를 차량 자세/카메라 각도로 월드 기준으로 회전시키는 유틸
         def rotate_vector(v, pitch, roll, yaw):
             pitch, roll, yaw = np.deg2rad(pitch), np.deg2rad(roll), np.deg2rad(yaw)
             Rx = np.array([[1,0,0],[0,np.cos(pitch),-np.sin(pitch)],[0,np.sin(pitch),np.cos(pitch)]])
@@ -600,6 +699,7 @@ class PresetCamWindow(QWidget, UIBase):
             Rz = np.array([[np.cos(roll),-np.sin(roll),0],[np.sin(roll),np.cos(roll),0],[0,0,1]])
             return Rz @ Ry @ Rx @ v
 
+        # depth가 없을 때 가상 바닥면(y=700mm)과의 교차점으로 대체
         def get_crosspnt(v, pos=700.0):
             v = np.asarray(v, dtype=float)
             ny_ = v[1]
@@ -615,6 +715,9 @@ class PresetCamWindow(QWidget, UIBase):
         cam_pan   = (self.get_ui_val("PanningAngle", float) or 0.0) - (self.get_ui_val("N", float) or 0.0)
         norm_rot  = rotate_vector(norm_vec, cam_pitch, 0, odom_yaw + cam_pan)
 
+        # depth 소스 선택:
+        # - Depth_Map: 실제 depth 사용 (무효값이면 가상 평면 fallback)
+        # - Virtual_Plane: 가상 평면만 사용
         tgt_depth_m = 0.0
         depth_src = self.get_ui_val("Depth_Src") or "Virtual_Plane"
         if depth_src == "Depth_Map":
@@ -634,23 +737,26 @@ class PresetCamWindow(QWidget, UIBase):
         else:
             pnt_3d = get_crosspnt(norm_rot)
 
-        self.set_ui_val("TgtPosX", f"{odom_y + pnt_3d[2] / 1000:.3f}")
+        # 목표 월드 좌표 표시값(m)
+        self.set_ui_val("TgtPosX", f"{pnt_3d[2] / 1000:.3f}")
         self.set_ui_val("TgtPosY", f"{pnt_3d[1] / 1000:.3f}")
-        self.set_ui_val("TgtPosZ", f"{odom_x + pnt_3d[0] / 1000:.3f}")
+        self.set_ui_val("TgtPosZ", f"{pnt_3d[0] / 1000:.3f}")
 
+        # 주행용 목표 거리(mm): depth가 있으면 해당 점 기준, 없으면 카메라 기준 보수 계산
         if tgt_depth_m > 0:
-            ny = norm_vec[1]
-            horiz_m = np.sqrt(max(tgt_depth_m**2 - (ny * tgt_depth_m)**2, 0))
-            veh_dist = float(min(horiz_m * 1000, 3000))
+            veh_dist = int(min(pnt_3d[0], 3000))
         else:
-            cam_pnt = get_crosspnt(norm_vec)  # camera frame, 0,0,0 기준
-            veh_dist = float(min(np.sqrt(cam_pnt[0]**2 + cam_pnt[2]**2), 3000))
-        self.set_ui_val("TgtDist", f"{int(veh_dist)}")
+            cam_pnt = get_crosspnt(norm_vec)
+            veh_dist = int(min(np.sqrt(cam_pnt[0]**2 + cam_pnt[2]**2), 3000))
+        self.set_ui_val("TgtDist", f"{veh_dist}")
 
+        # 절대 방위각(기준 N + 현재 panning 보정 포함)
         bearing_deg = int(pan_angle - (self.get_ui_val("N", int) or 0) + (self.get_ui_val("PanningAngle", int) or 0))
         self.set_ui_val("TgtBearing", f"{bearing_deg}")
 
-        # ── Ctrl+클릭: SeqCmd 자동 생성 + 마커 표시 ───────────
+        # Ctrl+클릭 모드:
+        # - 회전 + 전진 시퀀스 커맨드 생성
+        # - update_marker()용 노란/초록 추적 마커 초기 상태 저장
         if QApplication.keyboardModifiers() & Qt.ControlModifier:
             self.init_local()
             self.parent_window.sequential_cmd_list = []
@@ -678,12 +784,10 @@ class PresetCamWindow(QWidget, UIBase):
                     if valid.size > 0:
                         depth_m = float(np.median(valid))
 
-                        # ── [A] pixel → 3D (camera frame, 클릭 시점) ──────
-                        # cam_pos: 카메라 프레임 기준 3D 위치 (단위: m)
+                        # 클릭 시점 픽셀을 카메라 3D 좌표(m)로 저장
                         cam_pos = norm_vec * depth_m
 
-                        # ── 저장: 클릭 시점 카메라 프레임 벡터 그대로 보관 ─
-                        # 재투영은 update_marker에서 local_cam_pose yaw로 처리
+                        # 이후 update_marker()에서 이동/회전 보정 후 재투영에 사용
                         self._marker_cam_pos  = cam_pos.copy()
                         self._marker_cam_text = f"({cam_pos[0]:.1f},{cam_pos[1]:.1f},{cam_pos[2]:.1f},{depth_m:.1f})"
                         marker_text = self._marker_cam_text
@@ -691,3 +795,41 @@ class PresetCamWindow(QWidget, UIBase):
                         marker_text = "depth 0"
                         self._marker_cam_pos  = None
                 sw.set_marker(x, y, marker_text)
+
+                # 초록 마커: 클릭 위치와 가장 가까운 optflow 피처를 추적 기준점으로 저장
+                self._marker_flow_512_pos  = None
+                self._marker_flow_cam_text = ""
+                if hasattr(self, '_proc_odom_timer') and self._proc_odom_timer.isActive():
+                    optflow_pts = get_last_optflow_pts()
+                    if optflow_pts:
+                        # click 좌표를 optflow 좌표계(512x512)로 변환
+                        click_512_x = x * 512.0 / img_w
+                        click_512_y = y * 512.0 / img_h
+                        best_pt = min(optflow_pts,
+                                      key=lambda pt: (pt[0] - click_512_x)**2 + (pt[1] - click_512_y)**2)
+                        cx_512, cy_512 = best_pt
+                        # 선택된 optflow 점의 depth를 라벨용 3D 값 계산에 사용
+                        flow_depth_m = 0.0
+                        if depth_img is not None:
+                            fdh, fdw = depth_img.shape
+                            fdx = max(0, min(int(cx_512 * fdw / 512), fdw - 1))
+                            fdy = max(0, min(int(cy_512 * fdh / 512), fdh - 1))
+                            r_f = 2
+                            fpatch = depth_img[max(0, fdy-r_f):fdy+r_f+1,
+                                               max(0, fdx-r_f):fdx+r_f+1]
+                            fvalid = fpatch[np.isfinite(fpatch) & (fpatch > 0)]
+                            if fvalid.size > 0:
+                                flow_depth_m = float(np.median(fvalid))
+                        flow_tx = int(cx_512 * 1280 / 512)
+                        flow_ty = int(cy_512 * 720  / 512)
+                        flow_norm_vec = np.array(Pixelto3D(flow_tx, flow_ty, 1))
+                        flow_cam_pos  = flow_norm_vec * flow_depth_m
+                        self._marker_flow_512_pos  = [cx_512, cy_512]
+                        self._marker_flow_cam_text = (
+                            f"({flow_cam_pos[0]:.1f},{flow_cam_pos[1]:.1f},"
+                            f"{flow_cam_pos[2]:.1f},{flow_depth_m:.1f})")
+                        flow_px = int(cx_512 * img_w / 512)
+                        flow_py = int(cy_512 * img_h / 512)
+                        sw.set_marker2(flow_px, flow_py, self._marker_flow_cam_text)
+                    else:
+                        sw.set_marker2(0, 0, "")

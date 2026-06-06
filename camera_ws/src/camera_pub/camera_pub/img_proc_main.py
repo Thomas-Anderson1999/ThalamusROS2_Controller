@@ -52,6 +52,10 @@ _odometry_reset_flag = False
 _vio_cmd_type = None  # "MOVE" | "ROT" | None
 _last_vio_yaw  = 0.0
 _last_vio_dist = 0.0
+_last_optflow_pts = []  # list of (x, y) in img_sz(512) space
+
+def get_last_optflow_pts():
+    return _last_optflow_pts
 
 def reset_img_proc_odometry():
     global _odometry_reset_flag, _last_vio_yaw, _last_vio_dist
@@ -202,6 +206,9 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
             cx = int(cur_optKey[i][0][0])
             cy = int(cur_optKey[i][0][1])
             cur_list.append((cx,cy))
+
+        global _last_optflow_pts
+        _last_optflow_pts = cur_list
 
         global _last_vio_yaw, _last_vio_dist
         if local_idx > 0:
