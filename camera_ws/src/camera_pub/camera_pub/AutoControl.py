@@ -12,7 +12,7 @@ _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt, QTimer
-from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, reset_optflow_pts
+from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts
 from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
 
@@ -24,6 +24,8 @@ meter_per_enc = 11600
 rotate_pi_per_enc = 4819
 TRACK_MAX_PAN_STEP_DEG = 3.0
 TRACK_MAX_TILT_STEP_DEG = 3.0
+TRACK_PAN_DEADZONE_DEG = 2.0
+TRACK_TILT_DEADZONE_DEG = 2.0
 
 _ASM_FILE = "ScriptFreeModel.txt".encode("UTF-8")
 _thalamus_ready = False
@@ -564,14 +566,30 @@ class PresetCamWindow(QWidget, UIBase):
             sw.clear_rover_line()
             return
         optflow_pts = get_last_optflow_pts()
+        optflow_ids = get_last_optflow_ids()
         if not optflow_pts:
             sw.clear_rover_line()
             return
-        fx, fy = self._marker_flow_512_pos
-        best_pt = min(optflow_pts,
-                      key=lambda pt: (pt[0] - fx)**2 + (pt[1] - fy)**2)
-        self._marker_flow_512_pos = list(best_pt)   # 다음 프레임 기준점 갱신
-        cx_512, cy_512 = best_pt
+        # initOptflow 세대가 바뀌면 저장된 ID는 다른 피쳐를 가리키므로 무효화
+        current_gen = get_optflow_reset_count()
+        if getattr(self, '_marker_flow_reset_gen', None) != current_gen:
+            self._marker_flow_feature_id = None
+            self._marker_flow_reset_gen  = current_gen
+
+        # 고정된 피쳐 ID로 추적 — ID가 없으면 nearest-neighbor 폴백
+        feature_id = getattr(self, '_marker_flow_feature_id', None)
+        cx_512, cy_512 = None, None
+        if feature_id is not None and feature_id in optflow_ids:
+            idx = optflow_ids.index(feature_id)
+            cx_512, cy_512 = optflow_pts[idx]
+        else:
+            # 피쳐가 사라진 경우 현재 위치 기준 nearest-neighbor 로 재포착
+            fx, fy = self._marker_flow_512_pos
+            best_i = min(range(len(optflow_pts)),
+                         key=lambda i: (optflow_pts[i][0] - fx)**2 + (optflow_pts[i][1] - fy)**2)
+            cx_512, cy_512 = optflow_pts[best_i]
+            self._marker_flow_feature_id = optflow_ids[best_i] if best_i < len(optflow_ids) else None
+        self._marker_flow_512_pos = [cx_512, cy_512]
         flow_px = int(cx_512 * img_w / 512)
         flow_py = int(cy_512 * img_h / 512)
         if not (0 <= flow_px < img_w and 0 <= flow_py < img_h):
@@ -616,9 +634,9 @@ class PresetCamWindow(QWidget, UIBase):
 
         # 초록 마커를 화면 중앙으로 유도하기 위한 pan/tilt 목표 계산
         # 명령 충돌을 줄이기 위해 틱 기반으로 tilt/pan을 교대로 전송
-        _TRACK_N    = 5    # 명령 스케줄 주기
+        _TRACK_N    = 10    # 명령 스케줄 주기
         _TILT_TICK  = 1    # tilt 전송 틱
-        _PAN_TICK   = 3    # pan 전송 틱
+        _PAN_TICK   = 6    # pan 전송 틱
 
         self.set_ui_val("ClickPosX", str(flow_px))
         self.set_ui_val("ClickPosY", str(flow_py))
@@ -634,12 +652,12 @@ class PresetCamWindow(QWidget, UIBase):
         tilt_deg     = np.degrees(np.arctan2(-fny, np.sqrt(fnx*fnx + fnz*fnz)))
         current_tilt = self.get_ui_val("camera_pitch", float) or 0.0
         tilt_servo   = get_tilt_servo_angle(current_tilt + tilt_deg)
-        pan_servo    = int(pan_angle - (self.get_ui_val("N", int) or 0))
+        pan_servo    = pan_angle  # 증분 스텝: 화면 중앙 기준 편차각만 사용 (N 오프셋 불필요)
 
-        pan_step = float(np.clip(pan_servo, -TRACK_MAX_PAN_STEP_DEG, TRACK_MAX_PAN_STEP_DEG))
+        pan_step = 0.0 if abs(pan_servo) < TRACK_PAN_DEADZONE_DEG else float(np.clip(pan_servo, -TRACK_MAX_PAN_STEP_DEG, TRACK_MAX_PAN_STEP_DEG))
         cur_tilt_servo = float(self.get_ui_val("TiltAngle", float) or 0.0)
         tilt_delta = float(tilt_servo) - cur_tilt_servo
-        tilt_step = float(np.clip(tilt_delta, -TRACK_MAX_TILT_STEP_DEG, TRACK_MAX_TILT_STEP_DEG))
+        tilt_step = 0.0 if abs(tilt_delta) < TRACK_TILT_DEADZONE_DEG else float(np.clip(tilt_delta, -TRACK_MAX_TILT_STEP_DEG, TRACK_MAX_TILT_STEP_DEG))
         next_tilt_servo = int(np.clip(cur_tilt_servo + tilt_step, 0.0, 90.0))
 
         self.set_ui_val("TgtPan",  str(int(pan_step)))
@@ -652,7 +670,9 @@ class PresetCamWindow(QWidget, UIBase):
             self.set_ui_val("TiltAngle", str(next_tilt_servo))
             pw.SetTilt()
         elif tick == _PAN_TICK:
-            new_pan = (self.get_ui_val("PanningAngle", float) or 0.0) + pan_step
+            new_pan = float(np.clip(
+                (self.get_ui_val("PanningAngle", float) or 0.0) + pan_step,
+                -135.0, 135.0))
             self.set_ui_val("PanningAngle", str(int(new_pan)))
             pw.SetPanning()
 
@@ -666,26 +686,28 @@ class PresetCamWindow(QWidget, UIBase):
         if cmd_type == "MV_FWD":
             pw.set_ui_val("MVSpd", spd)
             pw.set_ui_val("Distance", val)
-            pw.MoveFoward()
+            pw.MoveFoward(_opt_reset=False)
         elif cmd_type == "MV_BACK":
             pw.set_ui_val("MVSpd", spd)
             pw.set_ui_val("Distance", val)
-            pw.MoveBackward()
+            pw.MoveBackward(_opt_reset=False)
         elif cmd_type == "RT_LEFT":
             pw.set_ui_val("RotSpd", spd)
             pw.set_ui_val("RotAngle", val)
-            pw.RotateLeft()
+            pw.RotateLeft(_opt_reset=False)
         elif cmd_type == "RT_RIGHT":
             pw.set_ui_val("RotSpd", spd)
             pw.set_ui_val("RotAngle", val)
-            pw.RotateRight()
+            pw.RotateRight(_opt_reset=False)
         self.parent_window.sequential_cmd_list = self.parent_window.sequential_cmd_list[1:]
         self.setUIVal("SeqCmd", self.parent_window.sequential_cmd_list)
 
     def cancel_tracking(self):
         """초록 마커 트래킹을 중단하고 관련 표시를 모두 제거한다."""
-        self._marker_flow_512_pos  = None
-        self._marker_flow_cam_text = ""
+        self._marker_flow_512_pos    = None
+        self._marker_flow_cam_text   = ""
+        self._marker_flow_feature_id = None
+        self._marker_flow_reset_gen  = None
         reset_optflow_pts()
         sw = getattr(self.parent_window, '_streaming_window', None)
         if sw is not None:
@@ -823,9 +845,9 @@ class PresetCamWindow(QWidget, UIBase):
         self.set_ui_val("TgtPosY", f"{pnt_world[1]:.3f}")
         self.set_ui_val("TgtPosZ", f"{pnt_world[0]:.3f}")
 
-        # 주행용 목표 거리 (mm, 최대 3000)
+        # 주행용 수평 거리 (mm, 최대 3000) — world frame X/Z 수평면 거리
         if depth_m > 0:
-            veh_dist = int(min(pnt_world[0] * 1000, 3000))
+            veh_dist = int(min(np.sqrt(pnt_world[0]**2 + pnt_world[2]**2) * 1000, 3000))
         else:
             cp = self._get_crosspnt(norm_vec)
             veh_dist = int(min(np.sqrt(cp[0]**2 + cp[2]**2) * 1000, 3000))
@@ -869,17 +891,23 @@ class PresetCamWindow(QWidget, UIBase):
                 sw.set_marker(x, y, self._marker_cam_text, pos_3d=pnt_world)
 
                 # 초록 마커: 가장 가까운 optflow 피처를 _compute_3d 로 동일 계산
-                self._marker_flow_512_pos  = None
-                self._marker_flow_cam_text = ""
+                self._marker_flow_512_pos    = None
+                self._marker_flow_cam_text   = ""
+                self._marker_flow_feature_id = None  # 고정 피쳐 ID
+                self._marker_flow_reset_gen  = get_optflow_reset_count()  # 클릭 시 세대
                 if hasattr(self, '_proc_odom_timer') and self._proc_odom_timer.isActive():
                     optflow_pts = get_last_optflow_pts()
+                    optflow_ids = get_last_optflow_ids()
                     if optflow_pts:
                         click_512_x = x * 512.0 / img_w
                         click_512_y = y * 512.0 / img_h
-                        best_pt = min(optflow_pts,
-                                      key=lambda pt: (pt[0] - click_512_x)**2
-                                                    + (pt[1] - click_512_y)**2)
-                        cx_512, cy_512 = best_pt
+                        best_i  = min(range(len(optflow_pts)),
+                                      key=lambda i: (optflow_pts[i][0] - click_512_x)**2
+                                                   + (optflow_pts[i][1] - click_512_y)**2)
+                        cx_512, cy_512 = optflow_pts[best_i]
+                        # 클릭 시점 피쳐 ID + 세대 고정
+                        self._marker_flow_feature_id = optflow_ids[best_i] if best_i < len(optflow_ids) else None
+                        self._marker_flow_reset_gen  = get_optflow_reset_count()
                         flow_px = cx_512 * img_w / 512
                         flow_py = cy_512 * img_h / 512
                         try:

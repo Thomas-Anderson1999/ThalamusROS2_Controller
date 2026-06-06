@@ -401,9 +401,10 @@ class Window(QWidget, UIBase):
         self.update_odometry = False
         stop_vio()
 
-    def MoveFoward(self):
+    def MoveFoward(self, _opt_reset=True):
         self.MotCancel()
-        reset_img_proc_odometry()
+        if _opt_reset:
+            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("MOVE")
         time.sleep(0.25)
@@ -413,9 +414,10 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def MoveBackward(self):
+    def MoveBackward(self, _opt_reset=True):
         self.MotCancel()
-        reset_img_proc_odometry()
+        if _opt_reset:
+            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("MOVE")
         time.sleep(0.25)
@@ -425,9 +427,10 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def RotateLeft(self):
+    def RotateLeft(self, _opt_reset=True):
         self.MotCancel()
-        reset_img_proc_odometry()
+        if _opt_reset:
+            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("ROT")
         time.sleep(0.25)
@@ -437,9 +440,10 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def RotateRight(self):
+    def RotateRight(self, _opt_reset=True):
         self.MotCancel()
-        reset_img_proc_odometry()
+        if _opt_reset:
+            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("ROT")
         time.sleep(0.25)

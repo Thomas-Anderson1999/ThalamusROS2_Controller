@@ -52,14 +52,24 @@ _odometry_reset_flag = False
 _vio_cmd_type = None  # "MOVE" | "ROT" | None
 _last_vio_yaw  = 0.0
 _last_vio_dist = 0.0
-_last_optflow_pts = []  # list of (x, y) in img_sz(512) space
+_last_optflow_pts = []    # list of (x, y) in img_sz(512) space
+_last_optflow_ids = []    # list of int feature IDs (idx_optKey), parallel to _last_optflow_pts
+_optflow_reset_count = 0  # initOptflow 호출 횟수 — ID 세대 구분용
 
 def get_last_optflow_pts():
     return _last_optflow_pts
 
+def get_last_optflow_ids():
+    return _last_optflow_ids
+
+def get_optflow_reset_count():
+    return _optflow_reset_count
+
 def reset_optflow_pts():
-    global _last_optflow_pts
+    global _last_optflow_pts, _last_optflow_ids, _optflow_reset_count
     _last_optflow_pts = []
+    _last_optflow_ids = []
+    _optflow_reset_count += 1
 
 def reset_img_proc_odometry():
     global _odometry_reset_flag, _last_vio_yaw, _last_vio_dist
@@ -189,6 +199,8 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
     st_contextRes = shrotterm_imgContext.inputImg(grayImg)
 
     if local_idx == 0: #initialize
+        global _optflow_reset_count
+        _optflow_reset_count += 1
         longterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
         shrotterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
         _vio.reset()
@@ -211,8 +223,9 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
             cy = int(cur_optKey[i][0][1])
             cur_list.append((cx,cy))
 
-        global _last_optflow_pts
+        global _last_optflow_pts, _last_optflow_ids
         _last_optflow_pts = cur_list
+        _last_optflow_ids = [int(v) for v in idx_opt]
 
         global _last_vio_yaw, _last_vio_dist
         if local_idx > 0:
@@ -224,6 +237,7 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
         vio_dist = _last_vio_dist
 
         if lens < 4: #re-initialize
+            _optflow_reset_count += 1
             longterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
             _vio.save_yaw(vio_yaw)
 
