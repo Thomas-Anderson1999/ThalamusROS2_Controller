@@ -57,6 +57,10 @@ _last_optflow_pts = []  # list of (x, y) in img_sz(512) space
 def get_last_optflow_pts():
     return _last_optflow_pts
 
+def reset_optflow_pts():
+    global _last_optflow_pts
+    _last_optflow_pts = []
+
 def reset_img_proc_odometry():
     global _odometry_reset_flag, _last_vio_yaw, _last_vio_dist
     _odometry_reset_flag = True

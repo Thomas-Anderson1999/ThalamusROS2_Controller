@@ -236,6 +236,8 @@ class Window(QWidget, UIBase):
             self._streaming_window.set_click_cb(self._click_cb)
         if self._dblclick_cb:
             self._streaming_window.set_dblclick_cb(self._dblclick_cb)
+        if self._preset_cam_win is not None:
+            self._streaming_window.set_esc_cb(self._preset_cam_win.cancel_tracking)
         self._streaming_window.show()
         self._streaming = True
 
