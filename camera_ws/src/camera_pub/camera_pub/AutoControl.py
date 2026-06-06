@@ -109,11 +109,14 @@ class PresetCamWindow(QWidget, UIBase):
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.COMBO, _caption="Depth_Src", _default_val=["Depth_Map", "Virtual_Plane"]),
+            UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosX", _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosY", _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="TgtPosZ", _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="TgtBearing", _default_val="0"),
-            UIElement(_type=UIElementType.EDIT, _caption="TgtDist", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="TgtDist",    _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="TgtRelDist", _default_val="-1"),
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.COMBO,  _caption="CamTrackMode", _default_val=["None", "fix_cam_rotation", "fix_on_target"]),
@@ -632,6 +635,12 @@ class PresetCamWindow(QWidget, UIBase):
         else:
             sw.clear_rover_line()
 
+        # 과이동 감지: 초록-로버 거리가 출발 시 TgtRelDist보다 짧아지면 MotCancel
+        tgt_rel_dist = self.get_ui_val("TgtRelDist", float) or -1.0
+        if tgt_rel_dist > 0 and sw._rover_dist is not None and sw._rover_dist < tgt_rel_dist:
+            self.set_ui_val("TgtRelDist", "-1")
+            pw.MotCancel()
+
         # 초록 마커를 화면 중앙으로 유도하기 위한 pan/tilt 목표 계산
         # 명령 충돌을 줄이기 위해 틱 기반으로 tilt/pan을 교대로 전송
         _TRACK_N    = 10    # 명령 스케줄 주기
@@ -683,6 +692,15 @@ class PresetCamWindow(QWidget, UIBase):
         parts = first_cmd.split()
         cmd_type, spd, val = parts[0], parts[1], parts[2]
         pw = self.parent_window
+        sw = getattr(pw, '_streaming_window', None)
+        m2_3d = sw._marker2_3d if sw is not None else None
+        m_3d  = sw._marker_3d  if sw is not None else None
+        if m2_3d is not None and m_3d is not None:
+            rel_dist = float(np.linalg.norm(np.asarray(m2_3d) - np.asarray(m_3d)))
+            self.set_ui_val("TgtRelDist", f"{rel_dist:.4f}")
+        else:
+            self.set_ui_val("TgtRelDist", "-1")
+
         if cmd_type == "MV_FWD":
             pw.set_ui_val("MVSpd", spd)
             pw.set_ui_val("Distance", val)
