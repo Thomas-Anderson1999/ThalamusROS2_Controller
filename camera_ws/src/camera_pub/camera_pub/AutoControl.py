@@ -144,7 +144,9 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="close_iter", _default_val="3"),
             UIElement(_type=UIElementType.EDIT,   _caption="forced_px",  _default_val="128,230"),
             UIElement(_type=UIElementType.EDIT,   _caption="normal_th",  _default_val="0.7"),
+            UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
+            UIElement(_type=UIElementType.BUTTON, _caption="clr_acc_bird_view",    _default_val=self.clr_acc_bird_view),
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
@@ -364,9 +366,23 @@ class PresetCamWindow(QWidget, UIBase):
         self._last_cam_roll    = cam_roll
         self._last_cam_heading = cam_heading
 
+        # Accumulated Bird View: 현재 Bird View와 동일한 사이즈로 선언 후 누적
+        if not hasattr(self, '_acc_birdview') or self._acc_birdview.shape != birdview.shape:
+            self._acc_birdview = np.zeros_like(birdview)
+        self._acc_birdview = cv2.bitwise_or(self._acc_birdview, birdview)
+
         cv2.imshow("Floor RANSAC", vis)
         cv2.imshow("Floor Mask", display_mask)
         cv2.imshow("Bird View", birdview)
+        cv2.imshow("Accumulated Bird View", self._acc_birdview)
+        cv2.waitKey(1)
+
+    def clr_acc_bird_view(self):
+        if not hasattr(self, '_acc_birdview'):
+            print("[clr_acc_bird_view] 누적된 Bird View가 없습니다.")
+            return
+        self._acc_birdview[:] = 0
+        cv2.imshow("Accumulated Bird View", self._acc_birdview)
         cv2.waitKey(1)
 
 

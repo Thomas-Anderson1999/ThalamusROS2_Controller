@@ -28,7 +28,7 @@ def depthmap_floor_ransac(depth_mm, target_shape, dist_th, cam_pitch=0.0, cam_ro
     Rz_T = np.array([[np.cos(r),  np.sin(r), 0],
                      [-np.sin(r), np.cos(r), 0],
                      [0,          0,          1]])
-    n_floor_cam = Rx_T @ Rz_T @ np.array([0.0, -1.0, 0.0])
+    n_floor_cam = Rz_T @ Rx_T @ np.array([0.0, -1.0, 0.0])
 
     pts = point_map.reshape(-1, 3)
     pts = pts[pts[:, 2] > 0]
