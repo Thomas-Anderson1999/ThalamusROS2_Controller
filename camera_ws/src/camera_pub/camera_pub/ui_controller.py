@@ -126,6 +126,7 @@ class Window(QWidget, UIBase):
         # ── communication ──────────────────────────────────────
         start_ele_list = [
             UIElement(_type=UIElementType.BUTTON, _caption="open_streaming",  _default_val=self.open_streaming),
+            UIElement(_type=UIElementType.BUTTON, _caption="still_shot",      _default_val=self.still_shot),
             UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry",  _default_val=self.reset_odometry),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
@@ -240,6 +241,26 @@ class Window(QWidget, UIBase):
             self._streaming_window.set_esc_cb(self._preset_cam_win.cancel_tracking)
         self._streaming_window.show()
         self._streaming = True
+
+    def still_shot(self):
+        rgb = self.ros_node.rgb_image
+        depth = self.ros_node.depth_image
+        if rgb is None:
+            self.get_logger().warn('still_shot: no rgb image available')
+            return
+        import os
+        from datetime import datetime
+        save_dir = os.path.join(
+            os.path.expanduser('~/ros_workplace/still_shots'),
+            datetime.now().strftime('%Y%m%d_%H%M%S')
+        )
+        os.makedirs(save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
+        if depth is not None:
+            import numpy as np
+            d = cv2.resize(depth, (256, 256), interpolation=cv2.INTER_NEAREST)
+            d.astype(np.float32).tofile(os.path.join(save_dir, 'depth.bin'))
+        self.get_logger().info(f'still_shot saved: {save_dir}')
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
