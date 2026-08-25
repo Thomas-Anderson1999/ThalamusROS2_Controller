@@ -18,7 +18,7 @@ from camera_pub.AutoControl import (
     PresetCamWindow, _init_thalamus,
     meter_per_enc, rotate_pi_per_enc, get_tilt_servo_angle,
 )
-from camera_pub.img_proc_main import reset_img_proc_odometry, stop_vio, set_vio_cmd_type, get_last_vio_yaw
+from camera_pub.img_proc_main import stop_vio, set_vio_cmd_type, get_last_vio_yaw
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import CompressedImage, Image
@@ -113,10 +113,10 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="RotAngle",      _default_val="90"),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="MotCancel",     _default_val=self.MotCancel),
-            UIElement(_type=UIElementType.BUTTON, _caption="MoveFoward",    _default_val=self.MoveFoward),
-            UIElement(_type=UIElementType.BUTTON, _caption="MoveBackward",  _default_val=self.MoveBackward),
-            UIElement(_type=UIElementType.BUTTON, _caption="RotateLeft",    _default_val=self.RotateLeft),
-            UIElement(_type=UIElementType.BUTTON, _caption="RotateRight",   _default_val=self.RotateRight),
+            UIElement(_type=UIElementType.BUTTON, _caption="MoveFoward",    _default_val=lambda _checked=False: self.MoveFoward()),
+            UIElement(_type=UIElementType.BUTTON, _caption="MoveBackward",  _default_val=lambda _checked=False: self.MoveBackward()),
+            UIElement(_type=UIElementType.BUTTON, _caption="RotateLeft",    _default_val=lambda _checked=False: self.RotateLeft()),
+            UIElement(_type=UIElementType.BUTTON, _caption="RotateRight",   _default_val=lambda _checked=False: self.RotateRight()),
             UIElement(_type=UIElementType.NEW_LINE),
         ]
         subgrid, start_dic = self.createGroupBox("basic control", start_ele_list)
@@ -422,10 +422,8 @@ class Window(QWidget, UIBase):
         self.update_odometry = False
         stop_vio()
 
-    def MoveFoward(self, _opt_reset=True):
+    def MoveFoward(self):
         self.MotCancel()
-        if _opt_reset:
-            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("MOVE")
         time.sleep(0.25)
@@ -435,10 +433,8 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def MoveBackward(self, _opt_reset=True):
+    def MoveBackward(self):
         self.MotCancel()
-        if _opt_reset:
-            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("MOVE")
         time.sleep(0.25)
@@ -448,10 +444,8 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def RotateLeft(self, _opt_reset=True):
+    def RotateLeft(self):
         self.MotCancel()
-        if _opt_reset:
-            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("ROT")
         time.sleep(0.25)
@@ -461,10 +455,8 @@ class Window(QWidget, UIBase):
         self.SendStr()
         self.update_odometry = True
 
-    def RotateRight(self, _opt_reset=True):
+    def RotateRight(self):
         self.MotCancel()
-        if _opt_reset:
-            reset_img_proc_odometry()
         self.vio_yaw_reset()
         set_vio_cmd_type("ROT")
         time.sleep(0.25)

@@ -14,7 +14,7 @@ _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt, QTimer
-from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts
+from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts, reset_vio, reset_optical_flow
 from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
 
@@ -163,6 +163,8 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.BUTTON, _caption="merge_on_globalmap", _default_val=self.merge_on_globalmap),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
+            UIElement(_type=UIElementType.BUTTON, _caption="reset_vio",          _default_val=self.on_reset_vio),
+            UIElement(_type=UIElementType.BUTTON, _caption="reset_optical_flow", _default_val=self.on_reset_optical_flow),
         ]
         subgrid2, dic2 = self.createGroupBox("Image Process", info_ele_list)
         self.ui_dic_list.append(dic2)
@@ -574,6 +576,24 @@ class PresetCamWindow(QWidget, UIBase):
             self._proc_odom_timer.start(50)
             print("[image_proc_odometry] 시작")
 
+    def reset_proc_odom_idx(self):
+        """MoveFoward/MoveBackward/RotateLeft/RotateRight 등 로버 이동 명령 시 호출.
+        img_proc_odometry의 local_idx 카운터를 0으로 되돌려 reset_img_proc_odometry()의
+        전역 플래그 리셋과 실제 추적 재초기화 주기를 동기화한다."""
+        if hasattr(self, '_proc_odom_local_idx'):
+            self._proc_odom_local_idx = 0
+            print("[reset_proc_odom_idx] _proc_odom_local_idx=0")
+
+    def on_reset_vio(self):
+        """vio_yaw / vio_dist만 0으로 리셋 (옵티컬 플로우 기준점은 그대로)."""
+        reset_vio()
+        print("[reset_vio] vio_yaw, vio_dist = 0")
+
+    def on_reset_optical_flow(self):
+        """longterm/shortterm 옵티컬 플로우 기준점만 다시 잡음 (vio_yaw/vio_dist는 그대로)."""
+        reset_optical_flow()
+        print("[reset_optical_flow] longterm/shortterm 기준점 재설정 예약됨")
+
     def _proc_odom_tick(self):
         if not self.parent_window._streaming:
             return
@@ -888,19 +908,19 @@ class PresetCamWindow(QWidget, UIBase):
         if cmd_type == "MV_FWD":
             pw.set_ui_val("MVSpd", spd)
             pw.set_ui_val("Distance", val)
-            pw.MoveFoward(_opt_reset=False)
+            pw.MoveFoward()
         elif cmd_type == "MV_BACK":
             pw.set_ui_val("MVSpd", spd)
             pw.set_ui_val("Distance", val)
-            pw.MoveBackward(_opt_reset=False)
+            pw.MoveBackward()
         elif cmd_type == "RT_LEFT":
             pw.set_ui_val("RotSpd", spd)
             pw.set_ui_val("RotAngle", val)
-            pw.RotateLeft(_opt_reset=False)
+            pw.RotateLeft()
         elif cmd_type == "RT_RIGHT":
             pw.set_ui_val("RotSpd", spd)
             pw.set_ui_val("RotAngle", val)
-            pw.RotateRight(_opt_reset=False)
+            pw.RotateRight()
         self.parent_window.sequential_cmd_list = self.parent_window.sequential_cmd_list[1:]
         self.setUIVal("SeqCmd", self.parent_window.sequential_cmd_list)
 

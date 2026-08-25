@@ -49,6 +49,8 @@ def get_text_height(text_scale):
 
 #+Image Processing : Odometry Reset / VIO cmd
 _odometry_reset_flag = False
+_vio_reset_flag      = False  # reset_vio() 전용 — vio_yaw/vio_dist만 리셋
+_optflow_reset_flag  = False  # reset_optical_flow() 전용 — longterm/shortterm 기준점만 리셋
 _vio_cmd_type = None  # "MOVE" | "ROT" | None
 _last_vio_yaw  = 0.0
 _last_vio_dist = 0.0
@@ -76,6 +78,18 @@ def reset_img_proc_odometry():
     _odometry_reset_flag = True
     _last_vio_yaw  = 0.0
     _last_vio_dist = 0.0
+
+def reset_vio():
+    """vio_yaw / vio_dist만 0으로 리셋 (다음 img_proc_odometry 프레임에 반영)."""
+    global _vio_reset_flag, _last_vio_yaw, _last_vio_dist
+    _vio_reset_flag = True
+    _last_vio_yaw  = 0.0
+    _last_vio_dist = 0.0
+
+def reset_optical_flow():
+    """longterm/shortterm 옵티컬 플로우 기준점만 다시 잡음 (다음 img_proc_odometry 프레임에 반영)."""
+    global _optflow_reset_flag
+    _optflow_reset_flag = True
 
 def stop_vio():
     global _vio_cmd_type
@@ -179,10 +193,17 @@ _vio = VIO(img_sz)
 #+vio
 
 def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars, cmd_type):
-    global _odometry_reset_flag, _vio_cmd_type
+    global _odometry_reset_flag, _vio_cmd_type, _vio_reset_flag, _optflow_reset_flag
     if _odometry_reset_flag:
         local_idx = 0
         _odometry_reset_flag = False
+
+    # local_idx==0(로버 이동/회전 시 리셋)이면 옵티컬 플로우/VIO 둘 다 리셋,
+    # reset_vio()/reset_optical_flow()로 세팅된 플래그면 해당하는 것만 리셋
+    do_optflow_reset = (local_idx == 0) or _optflow_reset_flag
+    do_vio_reset      = (local_idx == 0) or _vio_reset_flag
+    _optflow_reset_flag = False
+    _vio_reset_flag      = False
 
     effective_cmd = _vio_cmd_type
 
@@ -198,11 +219,23 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
     lt_contextRes = longterm_imgContext.inputImg(grayImg)
     st_contextRes = shrotterm_imgContext.inputImg(grayImg)
 
-    if local_idx == 0: #initialize
+    if do_optflow_reset: #initialize
         global _optflow_reset_count
         _optflow_reset_count += 1
         longterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
         shrotterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
+
+        # inputImg()가 리셋 전에 이미 계산해둔 stale 결과를, 방금 재초기화된
+        # 키포인트로 갱신 (show_once 화면 / _last_optflow_pts 모두 즉시 반영되도록)
+        lt_contextRes[0] = [longterm_imgContext.base_optKey,
+                            longterm_imgContext.cur_optKey,
+                            longterm_imgContext.idx_optKey]
+        if len(st_contextRes) > 1:
+            st_contextRes[1] = [shrotterm_imgContext.base_optKey,
+                                shrotterm_imgContext.cur_optKey,
+                                shrotterm_imgContext.idx_optKey]
+
+    if do_vio_reset:
         _vio.reset()
         _vio.regist_depthmap(depthmap)
 
@@ -228,7 +261,7 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
         _last_optflow_ids = [int(v) for v in idx_opt]
 
         global _last_vio_yaw, _last_vio_dist
-        if local_idx > 0:
+        if not do_vio_reset:
             if effective_cmd == "ROT":
                 _last_vio_yaw = _vio.calcul_yaw(base_list, cur_list)
             elif effective_cmd == "MOVE":
