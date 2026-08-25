@@ -1,6 +1,8 @@
 import os
 import time
 import sys
+import json
+from datetime import datetime
 import numpy as np
 import cv2
 
@@ -144,12 +146,14 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="close_iter", _default_val="3"),
             UIElement(_type=UIElementType.EDIT,   _caption="forced_px",  _default_val="128,230"),
             UIElement(_type=UIElementType.EDIT,   _caption="normal_th",  _default_val="0.7"),
-            
+
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac",   _default_val=self.predict_floor_ransac),
             UIElement(_type=UIElementType.BUTTON, _caption="clr_acc_bird_view",      _default_val=self.clr_acc_bird_view),
             UIElement(_type=UIElementType.EDIT, _caption="stable_time(ms)", _default_val="500"),
             UIElement(_type=UIElementType.BUTTON, _caption="act_get_local_birdview", _default_val=self.act_get_local_birdview),
+            UIElement(_type=UIElementType.BUTTON, _caption="get_global_birdview",    _default_val=self.get_global_birdview),
+            UIElement(_type=UIElementType.BUTTON, _caption="clear_tmp_localmap",     _default_val=self.clear_tmp_localmap),
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
@@ -392,6 +396,8 @@ class PresetCamWindow(QWidget, UIBase):
         """카메라를 LL→L→N→R→RR (틸트 DN 고정) 순서로 돌리며 매 위치마다
         stable_time(ms) 만큼 정착 대기 후 predict_floor_ransac을 실행,
         Accumulated Bird View에 누적한다."""
+        self.clr_acc_bird_view()
+
         stable_ms  = self.get_ui_val("stable_time(ms)", float)
         stable_sec = (stable_ms if stable_ms is not None else 500.0) / 1000.0
 
@@ -406,7 +412,147 @@ class PresetCamWindow(QWidget, UIBase):
         if hasattr(self, '_acc_birdview'):
             cv2.imshow("Accumulated Bird View", self._acc_birdview)
             cv2.waitKey(1)
+
+        self._save_local_birdview()
         print("[act_get_local_birdview] 완료")
+
+    def _save_local_birdview(self):
+        """tmp_local_view/birdviewNN.png + birdviewNN.json 으로
+        현재 Accumulated Bird View, 오도메트리 위치, 카메라 자세를 저장."""
+        if not hasattr(self, '_acc_birdview'):
+            print("[act_get_local_birdview] 저장할 Accumulated Bird View가 없습니다.")
+            return
+
+        save_dir = os.path.expanduser('~/ros_workplace/tmp_local_view')
+        os.makedirs(save_dir, exist_ok=True)
+
+        idx = 0
+        while os.path.exists(os.path.join(save_dir, f'birdview{idx:02d}.png')):
+            idx += 1
+        png_name  = f'birdview{idx:02d}.png'
+        json_name = f'birdview{idx:02d}.json'
+
+        pw = self.parent_window
+        odom_x   = pw.odom_x[-1]   if pw.odom_x   else 0.0
+        odom_y   = pw.odom_y[-1]   if pw.odom_y   else 0.0
+        odom_yaw = pw.odom_yaw[-1] if pw.odom_yaw else 0.0
+
+        att = pw.ros_node.attitude
+        cam_roll  = float(att.x) if att is not None else 0.0
+        cam_pitch = float(att.y) if att is not None else 0.0
+        cam_yaw   = float(att.z) if att is not None else 0.0
+
+        data = {
+            "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+            "odometry":  {"x": odom_x, "y": odom_y, "yaw": odom_yaw},
+            "attitude":  {"roll": cam_roll, "pitch": cam_pitch, "yaw": cam_yaw},
+            "birdview_png": png_name,
+        }
+
+        cv2.imwrite(os.path.join(save_dir, png_name), self._acc_birdview)
+        with open(os.path.join(save_dir, json_name), 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"[act_get_local_birdview] 저장 완료: {save_dir}/{png_name}, {json_name}")
+
+    def get_global_birdview(self):
+        """tmp_local_view에 저장된 모든 birdview*.json/png를 각 스냅샷의
+        오도메트리(x,y,yaw)를 이용해 world 프레임으로 정합, 하나의 큰
+        Global Bird View로 합쳐서 저장/표시한다."""
+        load_dir = os.path.expanduser('~/ros_workplace/tmp_local_view')
+        if not os.path.isdir(load_dir):
+            print(f"[get_global_birdview] {load_dir} 없음")
+            return
+
+        json_files = sorted(f for f in os.listdir(load_dir) if f.endswith('.json'))
+        snapshots = []
+        for jf in json_files:
+            try:
+                with open(os.path.join(load_dir, jf)) as f:
+                    meta = json.load(f)
+                png_path = os.path.join(load_dir, meta.get('birdview_png', ''))
+                img = cv2.imread(png_path)
+                if img is None:
+                    print(f"[get_global_birdview] {png_path} 로드 실패, 스킵")
+                    continue
+                snapshots.append((meta, img))
+            except Exception as e:
+                print(f"[get_global_birdview] {jf} 파싱 실패: {e}")
+
+        if not snapshots:
+            print("[get_global_birdview] tmp_local_view에 병합할 birdview가 없습니다.")
+            return
+
+        mm_per_px = 20.0          # local birdview / merge_on_globalmap 기본값과 동일 축척 (2cm/px)
+        scale     = 1.0 / mm_per_px
+
+        # world(mm) 범위 계산 → 캔버스 크기/원점 결정 (각 스냅샷의 로컬 맵 반경만큼 여유)
+        odom_xs_mm = [meta["odometry"]["x"] * 1000.0 for meta, _ in snapshots]
+        odom_ys_mm = [meta["odometry"]["y"] * 1000.0 for meta, _ in snapshots]
+        margin_mm  = max(max(img.shape[0], img.shape[1]) for _, img in snapshots) / scale
+        min_x, max_x = min(odom_xs_mm) - margin_mm, max(odom_xs_mm) + margin_mm
+        min_y, max_y = min(odom_ys_mm) - margin_mm, max(odom_ys_mm) + margin_mm
+
+        g_w = max(int((max_x - min_x) * scale), 1)
+        g_h = max(int((max_y - min_y) * scale), 1)
+        global_map = np.zeros((g_h, g_w, 3), dtype=np.uint8)
+
+        for meta, local_img in snapshots:
+            odom_x_mm = meta["odometry"]["x"] * 1000.0
+            odom_y_mm = meta["odometry"]["y"] * 1000.0
+            yaw_rad   = np.deg2rad(meta["odometry"]["yaw"])
+
+            h, w = local_img.shape[:2]
+            lcx, lcy = w // 2, int(h * 0.8)   # make_birdview과 동일한 로봇 축 픽셀
+
+            floor_mask = np.all(local_img == 255, axis=2)   # 마커(빨강/파랑) 제외, 순백=바닥만
+            py_idx, px_idx = np.nonzero(floor_mask)
+            if py_idx.size == 0:
+                continue
+
+            z_r = (lcy - py_idx) / scale   # 로봇 축 기준 전방 거리 (mm)
+            x_r = (px_idx - lcx) / scale   # 로봇 축 기준 우측 거리 (mm)
+            world_x = odom_x_mm + z_r * np.cos(yaw_rad) + x_r * np.sin(yaw_rad)
+            world_y = odom_y_mm + z_r * np.sin(yaw_rad) - x_r * np.cos(yaw_rad)
+
+            gx = ((world_x - min_x) * scale).astype(int)
+            gy = (g_h - (world_y - min_y) * scale).astype(int)
+            valid = (gx >= 0) & (gx < g_w) & (gy >= 0) & (gy < g_h)
+            global_map[gy[valid], gx[valid]] = 255
+
+        # 각 스냅샷의 오도메트리 위치를 로봇 축으로 표시
+        for meta, _ in snapshots:
+            odom_x_mm = meta["odometry"]["x"] * 1000.0
+            odom_y_mm = meta["odometry"]["y"] * 1000.0
+            gx = int((odom_x_mm - min_x) * scale)
+            gy = int(g_h - (odom_y_mm - min_y) * scale)
+            if 0 <= gx < g_w and 0 <= gy < g_h:
+                cv2.circle(global_map, (gx, gy), 3, (0, 0, 255), -1)
+
+        save_path = os.path.join(load_dir, 'global_birdview.png')
+        cv2.imwrite(save_path, global_map)
+        cv2.imshow("Global Bird View", global_map)
+        cv2.waitKey(1)
+        print(f"[get_global_birdview] 스냅샷 {len(snapshots)}개 병합 완료 "
+              f"({g_w}x{g_h}, {mm_per_px:.0f}mm/px) → {save_path}")
+
+    def clear_tmp_localmap(self):
+        """tmp_local_view 디렉토리 안의 birdview*.png/json, global_birdview.png를 모두 삭제."""
+        load_dir = os.path.expanduser('~/ros_workplace/tmp_local_view')
+        if not os.path.isdir(load_dir):
+            print(f"[clear_tmp_localmap] {load_dir} 없음")
+            return
+
+        removed = 0
+        for fname in os.listdir(load_dir):
+            if fname.endswith('.png') or fname.endswith('.json'):
+                try:
+                    os.remove(os.path.join(load_dir, fname))
+                    removed += 1
+                except OSError as e:
+                    print(f"[clear_tmp_localmap] {fname} 삭제 실패: {e}")
+
+        print(f"[clear_tmp_localmap] {load_dir} 안 파일 {removed}개 삭제 완료")
 
     def qt_imshow(self, title, img):
         cv2.imshow(title, img)
