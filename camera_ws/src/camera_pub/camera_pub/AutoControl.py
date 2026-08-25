@@ -144,9 +144,12 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="close_iter", _default_val="3"),
             UIElement(_type=UIElementType.EDIT,   _caption="forced_px",  _default_val="128,230"),
             UIElement(_type=UIElementType.EDIT,   _caption="normal_th",  _default_val="0.7"),
+            
             UIElement(_type=UIElementType.NEW_LINE),
-            UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac", _default_val=self.predict_floor_ransac),
-            UIElement(_type=UIElementType.BUTTON, _caption="clr_acc_bird_view",    _default_val=self.clr_acc_bird_view),
+            UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ransac",   _default_val=self.predict_floor_ransac),
+            UIElement(_type=UIElementType.BUTTON, _caption="clr_acc_bird_view",      _default_val=self.clr_acc_bird_view),
+            UIElement(_type=UIElementType.EDIT, _caption="stable_time(ms)", _default_val="500"),
+            UIElement(_type=UIElementType.BUTTON, _caption="act_get_local_birdview", _default_val=self.act_get_local_birdview),
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
@@ -385,6 +388,25 @@ class PresetCamWindow(QWidget, UIBase):
         cv2.imshow("Accumulated Bird View", self._acc_birdview)
         cv2.waitKey(1)
 
+    def act_get_local_birdview(self):
+        """카메라를 LL→L→N→R→RR (틸트 DN 고정) 순서로 돌리며 매 위치마다
+        stable_time(ms) 만큼 정착 대기 후 predict_floor_ransac을 실행,
+        Accumulated Bird View에 누적한다."""
+        stable_ms  = self.get_ui_val("stable_time(ms)", float)
+        stable_sec = (stable_ms if stable_ms is not None else 500.0) / 1000.0
+
+        presets = [("DN", "LL"), ("DN", "L"), ("DN", "N"), ("MD", "N"),  ("DN", "R"), ("DN", "RR")]
+        for tilt_key, pan_key in presets:
+            print(f"[act_get_local_birdview] preset tilt={tilt_key} pan={pan_key}, "
+                  f"stable_time={stable_sec:.2f}s 대기 후 predict_floor_ransac")
+            self.preset_control(tilt_key, pan_key)
+            time.sleep(stable_sec)
+            self.predict_floor_ransac()
+
+        if hasattr(self, '_acc_birdview'):
+            cv2.imshow("Accumulated Bird View", self._acc_birdview)
+            cv2.waitKey(1)
+        print("[act_get_local_birdview] 완료")
 
     def qt_imshow(self, title, img):
         cv2.imshow(title, img)
