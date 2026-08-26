@@ -51,6 +51,8 @@ def get_text_height(text_scale):
 _odometry_reset_flag = False
 _vio_reset_flag      = False  # reset_vio() 전용 — vio_yaw/vio_dist만 리셋
 _optflow_reset_flag  = False  # reset_optical_flow() 전용 — longterm/shortterm 기준점만 리셋
+_imu_yaw_bias        = 0.0    # reset_vio() 시점의 raw imu_yaw — 표시용 imu_yaw에서 빼서 0으로 맞춤
+_imu_yaw_reset_flag  = False  # 다음 img_proc_odometry 프레임에서 _imu_yaw_bias를 새로 캡처하라는 신호
 _vio_cmd_type = None  # "MOVE" | "ROT" | None
 _last_vio_yaw  = 0.0
 _last_vio_dist = 0.0
@@ -80,9 +82,11 @@ def reset_img_proc_odometry():
     _last_vio_dist = 0.0
 
 def reset_vio():
-    """vio_yaw / vio_dist만 0으로 리셋 (다음 img_proc_odometry 프레임에 반영)."""
-    global _vio_reset_flag, _last_vio_yaw, _last_vio_dist
+    """vio_yaw / vio_dist만 0으로 리셋 (다음 img_proc_odometry 프레임에 반영).
+    표시용 imu_yaw도 그 시점 값을 바이어스로 잡아서 같이 0부터 시작하게 한다."""
+    global _vio_reset_flag, _last_vio_yaw, _last_vio_dist, _imu_yaw_reset_flag
     _vio_reset_flag = True
+    _imu_yaw_reset_flag = True
     _last_vio_yaw  = 0.0
     _last_vio_dist = 0.0
 
@@ -205,6 +209,12 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
     _optflow_reset_flag = False
     _vio_reset_flag      = False
 
+    global _imu_yaw_bias, _imu_yaw_reset_flag
+    if _imu_yaw_reset_flag:
+        _imu_yaw_bias = pose_ars[0]
+        _imu_yaw_reset_flag = False
+    imu_yaw = pose_ars[0] - _imu_yaw_bias
+
     effective_cmd = _vio_cmd_type
 
     text_scale = 0.7
@@ -220,8 +230,13 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
     st_contextRes = shrotterm_imgContext.inputImg(grayImg)
 
     if do_optflow_reset: #initialize
-        global _optflow_reset_count
+        global _optflow_reset_count, _last_vio_yaw
         _optflow_reset_count += 1
+        if not do_vio_reset:
+            # VIO는 그대로 유지하면서 옵티컬 플로우 기준점만 새로 잡는 경우:
+            # base/cur가 리셋되면 상대각이 0으로 끊기므로, 지금까지 누적된 yaw를
+            # _vio.acc_yaw에 먼저 저장해서 리셋 이후에도 값이 끊기지 않게 한다.
+            _vio.save_yaw(_last_vio_yaw)
         longterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
         shrotterm_imgContext.initOptflow(cutOffbboxOpt1, featureParams)
 
@@ -260,7 +275,7 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
         _last_optflow_pts = cur_list
         _last_optflow_ids = [int(v) for v in idx_opt]
 
-        global _last_vio_yaw, _last_vio_dist
+        global _last_vio_dist  # _last_vio_yaw는 위(do_optflow_reset 블록)에서 이미 global 선언됨
         if not do_vio_reset:
             if effective_cmd == "ROT":
                 _last_vio_yaw = _vio.calcul_yaw(base_list, cur_list)
@@ -278,7 +293,7 @@ def img_proc_odometry(self, image, depthmap, local_idx, local_odometry, pose_ars
         wheel_odometry_dist = np.sqrt(local_odometry[0]**2 + local_odometry[1]**2)
         text = f"{effective_cmd}: oDist:{wheel_odometry_dist:.2f} oPos:{local_odometry[0]:.1f},{local_odometry[1]:.1f} oAtt:{local_odometry[2]:.1f}"
         cv2.putText(optRes, text, (10, img_sz - int(text_h * 3)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0), 1, cv2.LINE_AA)
-        text = f"imu_yaw:{pose_ars[0]:.1f} vio_yaw:{vio_yaw:.1f}, vio_dist:{vio_dist:.2f}"
+        text = f"imu_yaw:{imu_yaw:.1f} vio_yaw:{vio_yaw:.1f}, vio_dist:{vio_dist:.2f}"
         cv2.putText(optRes, text, (10, img_sz - int(text_h * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0), 1, cv2.LINE_AA)
         # -show text
         showOnceParam.append([optRes, None, "longterm optical flow Img"])

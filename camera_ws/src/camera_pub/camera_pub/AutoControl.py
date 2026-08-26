@@ -14,7 +14,7 @@ _PERSON_WEIGHT = os.path.join(_PKG_DIR, "cnn_weight", "person_best.pt")
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import Qt, QTimer
-from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts, reset_vio, reset_optical_flow
+from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts, reset_vio, reset_optical_flow, get_last_vio_yaw
 from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
 
@@ -97,6 +97,16 @@ class PresetCamWindow(QWidget, UIBase):
 
         # ── Auto-Control info ──────────────────────────────────
         info_ele_list = [
+
+            UIElement(_type=UIElementType.EDIT, _caption="MaxRotate", _default_val="30"),
+            UIElement(_type=UIElementType.EDIT, _caption="MaxRotMargin", _default_val="6"),
+            UIElement(_type=UIElementType.EDIT, _caption="InPosRotAngle", _default_val="1"),
+            UIElement(_type=UIElementType.EDIT, _caption="VioRotAngle", _default_val="90"),
+            UIElement(_type=UIElementType.BUTTON, _caption="vio_rot", _default_val=self.vio_rotation),
+            UIElement(_type=UIElementType.BUTTON, _caption="vio_estop", _default_val=self.vio_estop),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+
             UIElement(_type=UIElementType.EDIT,   _caption="ClickPosX",       _default_val="0"),
             UIElement(_type=UIElementType.EDIT,   _caption="ClickPosY",       _default_val="0"),
             UIElement(_type=UIElementType.EDIT,   _caption="TgtPan",          _default_val="0"),
@@ -129,6 +139,10 @@ class PresetCamWindow(QWidget, UIBase):
 
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.LISTBOX, _caption="SeqCmd", _default_val=None, _defalt_row=3, _defalt_culumn=8),
+
+
+
+
         ]
         subgrid2, dic2 = self.createGroupBox("Semi-Auto-Control", info_ele_list)
         self.ui_dic_list.append(dic2)
@@ -593,6 +607,164 @@ class PresetCamWindow(QWidget, UIBase):
         """longterm/shortterm 옵티컬 플로우 기준점만 다시 잡음 (vio_yaw/vio_dist는 그대로)."""
         reset_optical_flow()
         print("[reset_optical_flow] longterm/shortterm 기준점 재설정 예약됨")
+
+    # ── VIO 피드백 기반 점진적 회전 ──────────────────────────────
+    def vio_rotation(self):
+        """VioRotAngle만큼 카메라(패닝)를 회전시키되, 한 번에 MaxRotate(deg)씩만
+        나눠서 명령하고 그 결과(vio_yaw, 누적치)를 보며 다음 스텝 각도를 보정한다.
+
+        예) VioRotAngle=90, MaxRotate=30, MaxRotMargin=6
+            1) 30 명령 -> 실제 28 달성 (vio_yaw 누적)
+            2) 다음 이상적 누적 목표 = min(2*30, 90) = 60, 60-28=32 -> 32 명령
+               (32 <= MaxRotate+MaxRotMargin=36 이므로 허용)
+            3) |남은 각도| <= InPosRotAngle 이 될 때까지 반복
+
+        reset_vio/reset_optical_flow는 시작할 때 딱 한 번만 하고, 이후 스텝들은
+        하지 않아서 vio_yaw가 전체 시퀀스에 걸쳐 누적되도록 한다.
+        vio_estop()으로 언제든 중단 가능하도록 QTimer 기반 논블로킹으로 동작한다.
+        """
+        if getattr(self, '_vio_rot_active', False):
+            print("[vio_rotation] 이미 진행 중입니다. 먼저 vio_estop으로 멈춰주세요.")
+            return
+
+        target = self.get_ui_val("VioRotAngle", float)
+        if not target:
+            print("[vio_rotation] VioRotAngle 값이 없거나 0입니다.")
+            return
+        max_rot = self.get_ui_val("MaxRotate", float) or 30.0
+        if max_rot <= 0:
+            print("[vio_rotation] MaxRotate는 0보다 커야 합니다.")
+            return
+
+        self._vio_rot_active      = True
+        self._vio_rot_stop_req    = False
+        self._vio_rot_direction   = 1.0 if target >= 0 else -1.0
+        self._vio_rot_target_abs  = abs(target)
+        self._vio_rot_max_rot     = max_rot
+        self._vio_rot_margin      = self.get_ui_val("MaxRotMargin", float) or 0.0
+        self._vio_rot_tol         = self.get_ui_val("InPosRotAngle", float) or 1.0
+        self._vio_rot_checkpoint  = 0.0
+        self._vio_rot_step_count  = 0
+        self._vio_rot_max_steps   = int(np.ceil(self._vio_rot_target_abs / self._vio_rot_max_rot)) + 10
+        self._vio_rot_seen_moving = False
+        self._vio_rot_cmd_issued  = False  # 이번 시퀀스에서 RT 커맨드를 한 번이라도 냈는지
+        self._vio_rot_cmd_time    = None   # 마지막 커맨드를 낸 시각 (stat 타임아웃 판단용)
+
+        print(f"[vio_rotation] 시작: target={target}deg MaxRotate={max_rot} "
+              f"MaxRotMargin={self._vio_rot_margin} InPosRotAngle={self._vio_rot_tol}")
+
+        # 1) 카메라 뉴트럴(N/MD)
+        self.preset_control("MD", "N")
+        QTimer.singleShot(300, self._vio_rot_setup)
+
+    def _vio_rot_setup(self):
+        if not self._vio_rot_active or self._vio_rot_stop_req:
+            self._vio_rot_finish("시작 전 중단됨")
+            return
+
+        # 2) image_proc_odometry 추적 타이머 확인 후 안 켜져 있으면 켬
+        if not hasattr(self, '_proc_odom_timer') or not self._proc_odom_timer.isActive():
+            self.image_proc_odometry()
+
+        # 3) VIO / 옵티컬 플로우 기준점 리셋 (시퀀스 전체에서 딱 한 번)
+        reset_vio()
+        reset_optical_flow()
+
+        if not hasattr(self, '_vio_rot_timer'):
+            self._vio_rot_timer = QTimer(self)
+            self._vio_rot_timer.timeout.connect(self._vio_rot_tick)
+        self._vio_rot_timer.start(150)
+
+    _VIO_ROT_STEP_TIMEOUT = 4.0  # stat(모션 시작/종료) 신호를 못 받을 때 강제로 다음 단계로 넘어가기까지의 대기시간(s)
+
+    def _vio_rot_tick(self):
+        if self._vio_rot_stop_req:
+            self._vio_rot_finish("vio_estop으로 중단")
+            return
+
+        if self._vio_rot_cmd_issued:
+            # 이전에 낸 커맨드가 있으면, 그게 끝났는지(움직임 시작 -> 정지 엣지) 확인.
+            # stat1/stat2가 기대만큼 0으로 안 돌아오거나(혹은 애초에 3으로 안 올라가거나)
+            # 하는 하드웨어 특성이 있을 수 있으므로, 타임아웃 안에서는 정상 엣지 감지로
+            # 기다리고 타임아웃을 넘기면 stat 상태와 무관하게 강제로 다음 단계로 넘어간다.
+            md = self.parent_window.ros_node.motion_data
+            is_moving = (md is not None and md[4] != 0 and md[5] != 0)
+            elapsed = time.time() - self._vio_rot_cmd_time
+
+            if elapsed < self._VIO_ROT_STEP_TIMEOUT:
+                if is_moving:
+                    self._vio_rot_seen_moving = True
+                    return
+                if not self._vio_rot_seen_moving:
+                    return  # 아직 이전 명령이 모터에 반영되기 전 - 다음 틱에 재확인
+                # else: 정상적으로 움직였다가 멈춘 것 확인됨 -> 아래로 진행
+            else:
+                print(f"[vio_rotation] {self._VIO_ROT_STEP_TIMEOUT:.1f}s 타임아웃 -> "
+                      f"stat 상태(is_moving={is_moving})와 무관하게 완료로 간주하고 진행")
+
+            self._vio_rot_seen_moving = False  # 이번 스텝의 모션 종료 처리
+        # else: 아직 커맨드를 한 번도 안 냈으면(첫 스텝) 모션 대기 없이 바로 아래로 진행
+
+        achieved  = get_last_vio_yaw() * self._vio_rot_direction  # 목표 방향 기준으로 부호 정리
+        remaining = self._vio_rot_target_abs - achieved
+
+        if abs(remaining) <= self._vio_rot_tol:
+            self._vio_rot_finish(f"목표 도달 (achieved={achieved:.2f}deg)")
+            return
+
+        self._vio_rot_step_count += 1
+        if self._vio_rot_step_count > self._vio_rot_max_steps:
+            self._vio_rot_finish(f"최대 스텝({self._vio_rot_max_steps}) 초과, 수렴 실패 "
+                                 f"(achieved={achieved:.2f}deg)")
+            return
+
+        if remaining > 0:
+            # 아직 목표에 못 미침 -> 원래 방향으로, 이상적 누적 스케줄 대비 부족분만큼 전진
+            self._vio_rot_checkpoint = min(self._vio_rot_checkpoint + self._vio_rot_max_rot,
+                                            self._vio_rot_target_abs)
+            cmd = self._vio_rot_checkpoint - achieved
+            cmd = max(0.0, min(cmd, self._vio_rot_max_rot + self._vio_rot_margin))
+            cmd = min(cmd, remaining)  # 최종 목표를 넘어가지 않도록
+            step_dir = self._vio_rot_direction
+        else:
+            # 목표를 지나침(오버슈트) -> 반대 방향으로 되돌아오는 보정 커맨드
+            cmd = min(-remaining, self._vio_rot_max_rot + self._vio_rot_margin)
+            step_dir = -self._vio_rot_direction
+            self._vio_rot_checkpoint = achieved  # 다음 스케줄 기준점을 실제 위치로 재조정
+
+        if cmd <= 1e-6:
+            self._vio_rot_finish(f"진행 불가(cmd<=0), achieved={achieved:.2f}deg")
+            return
+
+        print(f"[vio_rotation] step{self._vio_rot_step_count}: achieved={achieved:.2f} "
+              f"remaining={remaining:.2f} -> cmd={cmd:.2f} ({'정' if step_dir > 0 else '역'}방향)")
+
+        self.set_ui_val("RotAngle", f"{cmd:.2f}")
+        if step_dir > 0:
+            self.parent_window.RotateRight()
+        else:
+            self.parent_window.RotateLeft()
+
+        self._vio_rot_cmd_issued = True
+        self._vio_rot_cmd_time   = time.time()
+
+    def vio_estop(self):
+        """vio_rotation 진행 중이면 즉시 정지."""
+        if not getattr(self, '_vio_rot_active', False):
+            print("[vio_estop] 진행 중인 vio_rotation이 없습니다.")
+            return
+        self._vio_rot_stop_req = True
+        self.parent_window.MotCancel()
+        print("[vio_estop] 정지 요청")
+
+    def _vio_rot_finish(self, msg):
+        if hasattr(self, '_vio_rot_timer'):
+            self._vio_rot_timer.stop()
+        self._vio_rot_active = False
+        # MotCancel()이 stop_vio()도 호출해서 _vio_cmd_type을 꺼줌 -> 시퀀스가 끝난 뒤
+        # 백그라운드 image_proc_odometry 트래커가 계속 calcul_yaw()를 재계산하지 않게 함
+        self.parent_window.MotCancel()
+        print(f"[vio_rotation] 종료: {msg}")
 
     def _proc_odom_tick(self):
         if not self.parent_window._streaming:
