@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.expanduser('~/ros_workplace/venv/lib/python3.12/site-
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import cv2
 import numpy as np
 import pyrealsense2 as rs
@@ -25,8 +26,15 @@ class CameraNodeD455i(Node):
         self.bridge = CvBridge()
 
         # ---------- Publishers ----------
-        self.rgb_pub = self.create_publisher(CompressedImage, '/camera/rgb/compressed', 10)
-        self.depth_pub = self.create_publisher(Image, '/camera/depth', 10)
+        # 라이브 스트림은 재전송 없이 최신 프레임만 — BEST_EFFORT + KEEP_LAST 1
+        stream_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.rgb_pub = self.create_publisher(CompressedImage, '/camera/rgb/compressed', stream_qos)
+        self.depth_pub = self.create_publisher(Image, '/camera/depth', stream_qos)
         self.att_pub = self.create_publisher(Vector3, 'camera_attitude', 10)
 
         self.declare_parameter('show_preview', True)

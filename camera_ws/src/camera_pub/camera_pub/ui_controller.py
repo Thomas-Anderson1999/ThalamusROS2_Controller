@@ -7,6 +7,7 @@ import cv2
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
 from PyQt5.QtCore import QTimer, Qt
@@ -37,8 +38,15 @@ class UIControllerNode(Node):
         self.rgb_image   = None  # numpy BGR
         self.depth_image = None  # numpy float32
 
-        self.create_subscription(CompressedImage, '/camera/rgb/compressed', self._on_rgb, 10)
-        self.create_subscription(Image, '/camera/depth', self._on_depth, 10)
+        # 발행측(camera_node_d455i)과 동일하게 BEST_EFFORT + KEEP_LAST 1
+        stream_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(CompressedImage, '/camera/rgb/compressed', self._on_rgb, stream_qos)
+        self.create_subscription(Image, '/camera/depth', self._on_depth, stream_qos)
 
     def _on_serial_msg(self, msg):
         print(f'[serial] {msg.data}')
@@ -126,7 +134,11 @@ class Window(QWidget, UIBase):
         # ── communication ──────────────────────────────────────
         start_ele_list = [
             UIElement(_type=UIElementType.BUTTON, _caption="open_streaming",  _default_val=self.open_streaming),
+
+            UIElement(_type=UIElementType.EDIT, _caption="MinMaxDepth", _default_val="600:6000"),
+            UIElement(_type=UIElementType.EDIT, _caption="AvgCnt", _default_val="10"),
             UIElement(_type=UIElementType.BUTTON, _caption="still_shot",      _default_val=self.still_shot),
+
             UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry",  _default_val=self.reset_odometry),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
@@ -244,10 +256,53 @@ class Window(QWidget, UIBase):
 
     def still_shot(self):
         rgb = self.ros_node.rgb_image
-        depth = self.ros_node.depth_image
         if rgb is None:
-            self.get_logger().warn('still_shot: no rgb image available')
+            self.ros_node.get_logger().warn('still_shot: no rgb image available')
             return
+
+        # MinMaxDepth: "min:max" (mm) - depth_image 자체는 m 단위라 비교 전에 변환
+        min_max_str = self.get_ui_val("MinMaxDepth") or "600:6000"
+        try:
+            depth_min_mm, depth_max_mm = (float(v) for v in min_max_str.split(":"))
+        except Exception:
+            self.ros_node.get_logger().warn(
+                f"still_shot: MinMaxDepth 파싱 실패 '{min_max_str}', 기본값(600:6000) 사용")
+            depth_min_mm, depth_max_mm = 600.0, 6000.0
+        depth_min_m = depth_min_mm / 1000.0
+        depth_max_m = depth_max_mm / 1000.0
+
+        avg_cnt = max(int(self.get_ui_val("AvgCnt", float) or 10), 1)
+        min_valid_cnt = avg_cnt // 2  # 유효 샘플 수가 이 값 이하(=절반 이하)면 0으로 처리
+
+        depth_sum   = None
+        depth_count = None
+        prev_depth  = None
+        collected   = 0
+        max_wait_iters = avg_cnt * 20  # depth가 전혀 안 들어올 때 대비한 안전 타임아웃
+
+        for _ in range(max_wait_iters):
+            if collected >= avg_cnt:
+                break
+            d = self.ros_node.depth_image
+            if d is None or d is prev_depth:
+                time.sleep(0.02)
+                continue
+            prev_depth = d
+
+            if depth_sum is None:
+                depth_sum   = np.zeros(d.shape, dtype=np.float64)
+                depth_count = np.zeros(d.shape, dtype=np.int32)
+
+            valid = np.isfinite(d) & (d >= depth_min_m) & (d <= depth_max_m)
+            depth_sum[valid]   += d[valid]
+            depth_count[valid] += 1
+            collected += 1
+            time.sleep(0.02)
+
+        if collected < avg_cnt:
+            self.ros_node.get_logger().warn(
+                f'still_shot: depth 프레임 {collected}/{avg_cnt}개만 모음 (타임아웃)')
+
         import os
         from datetime import datetime
         save_dir = os.path.join(
@@ -256,11 +311,32 @@ class Window(QWidget, UIBase):
         )
         os.makedirs(save_dir, exist_ok=True)
         cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
-        if depth is not None:
-            import numpy as np
-            d = cv2.resize(depth, (256, 256), interpolation=cv2.INTER_NEAREST)
-            d.astype(np.float32).tofile(os.path.join(save_dir, 'depth.bin'))
-        self.get_logger().info(f'still_shot saved: {save_dir}')
+
+        if depth_sum is not None:
+            depth_avg = np.zeros(depth_sum.shape, dtype=np.float32)
+            valid_mask = depth_count > min_valid_cnt
+            depth_avg[valid_mask] = (depth_sum[valid_mask] / depth_count[valid_mask]).astype(np.float32)
+            depth_avg *= 1000.0  # m -> mm (depth.bin은 mm 단위로 저장)
+            depth_avg.tofile(os.path.join(save_dir, 'depth.bin'))
+        else:
+            depth_avg = None
+            self.ros_node.get_logger().warn('still_shot: depth 프레임을 하나도 못 모아서 depth.bin은 저장하지 않음')
+
+        self.ros_node.get_logger().info(f'still_shot saved: {save_dir}')
+
+        # 저장한 것을 그대로 화면에 표시
+        cv2.imshow("Still Shot - RGB", rgb)
+        if depth_avg is not None:
+            d_vis = depth_avg.copy()
+            valid_d = d_vis[d_vis > 0]
+            if valid_d.size > 0:
+                mn, mx = np.percentile(valid_d, 1), np.percentile(valid_d, 99)
+                d_vis = np.clip(d_vis, mn, mx)
+                d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+            else:
+                d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+            cv2.imshow("Still Shot - Depth(avg)", cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+        cv2.waitKey(1)
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
