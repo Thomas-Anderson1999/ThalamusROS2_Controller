@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import copy
 import threading
@@ -9,17 +10,24 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout
+from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QTabWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer, Qt
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from camera_pub.ui_utils import StreamingWindow
 from camera_pub.ThalamusJoystick import ThalamusJoystick
+from camera_pub import AutoControl as _auto_control
 from camera_pub.AutoControl import (
     PresetCamWindow, _init_thalamus,
     meter_per_enc, rotate_pi_per_enc, get_tilt_servo_angle,
 )
 from camera_pub.img_proc_main import stop_vio, set_vio_cmd_type, get_last_vio_yaw
+from ThalamusEngine.Interface import (
+    ObjMeshUp, TexureOveray, TextureInterpolation, getTextureImg,
+    LoadBinDepthMapPnt, InitializeRenderFacet,
+    LoadThalamusInterface, InitEngine, StartExt3DEngine,
+    SetGlobalPosition, SetGlobalAttitude,
+)
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import CompressedImage, Image
@@ -169,7 +177,77 @@ class Window(QWidget, UIBase):
         self.mainGrid.addWidget(subgrid, 2, 0)
         self.mainGrid.setRowMinimumHeight(2, 300)
 
-        self.setLayout(self.mainGrid)
+        # ── Reconstruction (Mesh up / Texture Overlay) ─────────
+        recon_ele_list = [
+            UIElement(_type=UIElementType.EDIT,   _caption="WorkingDir",      _default_val="~/ros_workplace"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconScriptFile", _default_val="ScriptFreeModel.txt"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconEngineName",  _default_val="Thalamus Reconstruction"),
+            UIElement(_type=UIElementType.BUTTON, _caption="Engine Start",     _default_val=self.ReconEngineStart),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconDepthBin",  _default_val="Dataset/Dataset03/DepthBin03.txt"),
+            UIElement(_type=UIElementType.EDIT, _caption="DepthWidth", _default_val="256"),
+            UIElement(_type=UIElementType.EDIT, _caption="Deptheight", _default_val="256"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconColorImg",  _default_val="Dataset/Dataset03/Color03.png"),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="ReconWidth", _default_val="300"),
+            UIElement(_type=UIElementType.EDIT, _caption="ReconHeight", _default_val="300"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconMeshUpInv", _default_val="9"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconFreeModelNum", _default_val="5"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconThread",    _default_val="12"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcPosX",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcPosY",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcWidth",  _default_val="1280"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcHeight", _default_val="720"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconObjID",     _default_val="-1"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="MeshUp",          _default_val=self.ReconMeshUp),
+            UIElement(_type=UIElementType.BUTTON, _caption="Texture Overlay", _default_val=self.ReconTexOverlay),
+            #UIElement(_type=UIElementType.BUTTON, _caption="Texture Int",     _default_val=self.ReconTexInt),
+            UIElement(_type=UIElementType.BUTTON, _caption="TextureView",     _default_val=self.ReconTexView),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT,   _caption="PosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="PosY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="PosZ", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttZ", _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="SetPosAtt", _default_val=self.ReconSetPosAtt),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosY", _default_val="8000"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosZ", _default_val="-3000"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttX", _default_val="90"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttZ", _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="BirdView", _default_val=self.ReconBirdView),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
+        recon_subgrid, recon_dic = self.createGroupBox("Mesh up / Texture Overlay", recon_ele_list)
+        self.ui_dic_list.append(recon_dic)
+        recon_grid = QGridLayout()
+        recon_grid.addWidget(recon_subgrid, 0, 0)
+        recon_grid.setRowStretch(1, 1)
+        recon_tab = QWidget()
+        recon_tab.setLayout(recon_grid)
+
+        # ── tabs ───────────────────────────────────────────────
+        control_tab = QWidget()
+        control_tab.setLayout(self.mainGrid)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(control_tab, "Control")
+        self.tabs.addTab(recon_tab, "Reconstruction")
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.tabs)
+        self.setLayout(outer)
+
         self.setWindowTitle("Basic Control")
         self.resize(1000, 1000)
         self.LoadPreset()
@@ -655,6 +733,145 @@ class Window(QWidget, UIBase):
                 self.SendStr()
 
         self.old_hat = copy.deepcopy(hat)
+
+    # ── Reconstruction : Mesh up / Texture Overlay ─────────────
+    def _recon_workdir(self):
+        return os.path.expanduser(self.get_ui_val("WorkingDir") or "~/ros_workplace")
+
+    def _recon_path(self, key):
+        p = os.path.expanduser(self.get_ui_val(key) or "")
+        if p and not os.path.isabs(p):
+            p = os.path.join(self._recon_workdir(), p)
+        return p
+
+    def ReconEngineStart(self):
+        workdir = self._recon_workdir()
+        if os.path.isdir(workdir):
+            os.chdir(workdir)
+            print(f"ReconEngineStart: cwd -> {workdir}")
+        else:
+            print(f"ReconEngineStart: WorkingDir 없음 ({workdir}), 현재 cwd 사용 {os.getcwd()}")
+
+        asm = (self.get_ui_val("ReconScriptFile") or "ScriptFreeModel.txt").encode("UTF-8")
+        win_text = (self.get_ui_val("ReconEngineName") or "Thalamus Reconstruction").encode("UTF-8")
+
+        if not LoadThalamusInterface():
+            print("ReconEngineStart: LoadThalamusInterface FAILED")
+            return
+
+        err = InitEngine(asm, 1280, 720, 0)
+        if err != 0:
+            msg = ""
+            if err & 1:
+                msg += "env.txt "
+            if err & 2:
+                msg += "script"
+            print(f"ReconEngineStart: InitEngine error {err} ({msg})")
+
+        StartExt3DEngine(asm, win_text)
+        _auto_control._thalamus_ready = True  # 이후 _init_thalamus() 재초기화 방지
+        print("ReconEngineStart: engine started")
+
+    def ReconSetPosAtt(self):
+        _init_thalamus()
+        px = self.get_ui_val("PosX", float) or 0.0
+        py = self.get_ui_val("PosY", float) or 0.0
+        pz = self.get_ui_val("PosZ", float) or 0.0
+        ax = self.get_ui_val("AttX", float) or 0.0
+        ay = self.get_ui_val("AttY", float) or 0.0
+        az = self.get_ui_val("AttZ", float) or 0.0
+
+        SetGlobalAttitude(ax, ay, az)
+        SetGlobalPosition(px, py, pz)
+        InitializeRenderFacet(-1, -1)
+
+    def ReconBirdView(self):
+        for src, dst in (("Bird_PosX", "PosX"), ("Bird_PosY", "PosY"), ("Bird_PosZ", "PosZ"),
+                         ("Bird_AttX", "AttX"), ("Bird_AttY", "AttY"), ("Bird_AttZ", "AttZ")):
+            self.set_ui_val(dst, self.get_ui_val(src) or "0")
+        self.ReconSetPosAtt()
+
+    def _recon_view_param(self):
+        dim_w  = self.get_ui_val("ReconWidth",  int) or 300
+        dim_h  = self.get_ui_val("ReconHeight", int) or 300
+        obj_id = self.get_ui_val("ReconObjID",  int)
+        return (
+            self.get_ui_val("ReconSrcPosX",   int) or 0,
+            self.get_ui_val("ReconSrcPosY",   int) or 0,
+            self.get_ui_val("ReconSrcWidth",  int) or 1280,
+            self.get_ui_val("ReconSrcHeight", int) or 720,
+            dim_w,
+            dim_h,
+            obj_id if obj_id is not None else -1,
+        )
+
+    def ReconMeshUp(self):
+        _init_thalamus()
+        dep_w    = self.get_ui_val("DepthWidth",        int) or 256
+        dep_h    = self.get_ui_val("Deptheight",        int) or 256
+        dep_inv  = self.get_ui_val("ReconMeshUpInv",    int) or 0
+        mesh_typ = self.get_ui_val("ReconFreeModelNum", int) or 0
+        depth_bin = self._recon_path("ReconDepthBin")
+
+        if not os.path.isfile(depth_bin):
+            print(f"MeshUp: depth 파일 없음 ({depth_bin})")
+            return
+        n_bytes  = os.path.getsize(depth_bin)
+        exp_side = int(round((n_bytes / 4) ** 0.5))
+        if n_bytes != dep_w * dep_h * 4:
+            print(f"MeshUp: 크기 불일치 - 파일 {n_bytes}B (float32 {n_bytes // 4}개"
+                  f"{f', {exp_side}x{exp_side}' if exp_side * exp_side * 4 == n_bytes else ''})"
+                  f" vs DepthWidth*Deptheight={dep_w}x{dep_h}={dep_w * dep_h}. "
+                  f"DepthWidth/Deptheight를 파일에 맞춰 조정하세요.")
+            return
+
+        Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+        Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+
+        if 0 != LoadBinDepthMapPnt(depth_bin, dep_w, dep_h, 600, 6000,
+                                   Depth_Map.ctypes, Depth_Mask.ctypes):
+            Depth_Map = cv2.normalize(Depth_Map, None, alpha=0, beta=1.0,
+                                      norm_type=cv2.NORM_MINMAX)
+            cv2.imshow("Depth Map", Depth_Map)
+            cv2.waitKey(1)
+            ret = ObjMeshUp(dep_w, dep_h, mesh_typ, dep_inv)
+            print("ObjMeshUp:", ret)
+            InitializeRenderFacet(-1, -1)
+        else:
+            print(f"MeshUp: depth load error ({depth_bin})")
+
+    def ReconTexOverlay(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        tex_path = self._recon_path("ReconColorImg")
+
+        Texture = cv2.imread(tex_path)
+        if Texture is None:
+            print(f"Texture Overlay: cannot read image ({tex_path})")
+            return
+        Texture = np.ascontiguousarray(Texture)
+        tex_h, tex_w = Texture.shape[:2]
+        cv2.imshow("Texture Src", Texture)
+        cv2.waitKey(1)
+
+        _, _, src_w, src_h, _, _, _ = self._recon_view_param()
+        TexureOveray(thread, Texture.ctypes, tex_w, tex_h, src_w, src_h)
+
+    def ReconTexInt(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        TextureInterpolation(thread)
+        print("Texture Interpolation")
+
+    def ReconTexView(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        src_x, src_y, src_w, src_h, dest_w, dest_h, obj_id = self._recon_view_param()
+
+        TextuedView = np.zeros((dest_h, dest_w, 3), np.uint8)
+        getTextureImg(thread, TextuedView.ctypes, src_x, src_y, src_w, src_h, dest_w, dest_h, obj_id)
+        cv2.imshow("Texture View", TextuedView)
+        cv2.waitKey(1)
 
     def quit_app(self):
         self.joystick_timer.stop()
