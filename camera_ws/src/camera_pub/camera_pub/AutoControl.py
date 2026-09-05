@@ -29,7 +29,7 @@ TRACK_MAX_TILT_STEP_DEG = 3.0
 TRACK_PAN_DEADZONE_DEG = 2.0
 TRACK_TILT_DEADZONE_DEG = 2.0
 
-_ASM_FILE = "ScriptFreeModel.txt".encode("UTF-8")
+_ASM_FILE = os.path.join(os.path.expanduser("~/ros_workplace"), "ScriptFreeModel.txt").encode("UTF-8")
 _thalamus_ready = False
 
 

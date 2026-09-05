@@ -1,0 +1,8 @@
+{"x": 0, "y": 1080, "width": 1297, "height": 1000}
+{"SendStr": "", "TiltAngle": "45", "PanningAngle": "0", "MVSpd": "1600", "Distance": "500", "RotSpd": "600", "RotAngle": "90"}
+{"MinMaxDepth": "600:6000", "AvgCnt": "10", "camera_roll": "0", "camera_pitch": "0", "camera_yaw": "0", "odom_yaw": "0", "enc1": "0", "enc2": "0", "spd1": "0", "spd2": "0", "stat1": "0", "stat2": "0"}
+{}
+{"ReconScriptFile": "ScriptFreeModel.txt", "ReconEngineName": "Thalamus Reconstruction", "ReconDepthBin": "still_shots/20260827_222726/depth.bin", "ReconColorImg": "still_shots/20260827_222726/img.png", "ReconWidth": "256", "ReconHeight": "256", "ReconMeshUpInv": "9", "ReconFreeModelNum": "5", "ReconThread": "12", "ReconSrcPosX": "0", "ReconSrcPosY": "0", "ReconSrcWidth": "1280", "ReconSrcHeight": "720", "ReconDestWidth": "300", "ReconDestHeight": "300", "ReconObjID": "-1"}
+{"LLL": "-127", "LL": "-82", "L": "-37", "N": "8", "R": "53", "RR": "98", "RRR": "135", "UP": "0", "MD": "20", "DN": "65"}
+{"MaxRotate": "30", "MaxRotMargin": "6", "InPosRotAngle": "1", "VioRotAngle": "90", "ClickPosX": "0", "ClickPosY": "0", "TgtPan": "0", "TgtTilt": "0", "odometry_X": "0", "odometry_Y": "0", "odometry_Yaw": "0", "local_action_yaw": "0", "Depth_Src": "Depth_Map", "TgtPosX": "0", "TgtPosY": "0", "TgtPosZ": "0", "TgtBearing": "0", "TgtDist": "0", "TgtRelDist": "-1", "CamTrackMode": "None", "local_pos": "0,0,0", "local_cam_pose": "0,0,0"}
+{"conf": "0.25", "iou": "0.5", "dist_th": "50.0", "close_iter": "3", "forced_px": "128,230", "normal_th": "0.7", "stable_time(ms)": "500", "gmap_ox": "0", "gmap_oy": "0", "scale_per1pix": "20"}

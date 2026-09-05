@@ -880,6 +880,17 @@ class Window(QWidget, UIBase):
         cv2.destroyAllWindows()
         QApplication.quit()
 
+        # Engine Start로 띄운 "Thalamus Reconstruction" 창(Simul3DStart)은
+        # non-daemon 스레드에서 자체 GLUT 루프로 돌고, 이를 닫는 API가 없어서
+        # Qt만 종료하면 그 스레드가 프로세스 종료를 막아 창이 안 꺼진다.
+        # 남길 정리를 마친 뒤 프로세스를 통째로 강제 종료해서 같이 닫는다.
+        try:
+            self.ros_node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
+
 
 def main(args=None):
     _init_thalamus()
