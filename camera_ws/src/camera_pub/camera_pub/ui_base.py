@@ -108,7 +108,10 @@ class DoubleClickButton(QPushButton):
 
 class UIBase:
     def __init__(self, fname="preset.txt"):
-        self.fname = fname
+        # Engine Start(ReconEngineStart)가 os.chdir()로 cwd를 바꿔버리면 이후
+        # SavePreset/LoadPreset이 상대경로 "preset.txt"를 다른 위치로 읽고 쓰게
+        # 되므로, 생성 시점(=아직 chdir 되기 전)의 cwd 기준으로 절대경로를 고정한다.
+        self.fname = os.path.abspath(fname)
 
     # ------------------------------------------------------------
     # UI construction

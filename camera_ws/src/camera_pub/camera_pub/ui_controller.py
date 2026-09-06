@@ -26,7 +26,7 @@ from ThalamusEngine.Interface import (
     ObjMeshUp, TexureOveray, TextureInterpolation, getTextureImg,
     LoadBinDepthMapPnt, InitializeRenderFacet,
     LoadThalamusInterface, InitEngine, StartExt3DEngine,
-    SetGlobalPosition, SetGlobalAttitude,
+    SetGlobalPosition, SetGlobalAttitude, SetObjectContextPosAtt,
 )
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3
@@ -226,6 +226,26 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttZ", _default_val="0"),
             UIElement(_type=UIElementType.BUTTON, _caption="BirdView", _default_val=self.ReconBirdView),
             UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="ObjID", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosZ", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttZ", _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="ObjSetPosAtt", _default_val=self.ObjSetPosAtt),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="AniPosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniPosZ", _default_val="-500"),
+            UIElement(_type=UIElementType.EDIT, _caption="StepPos", _default_val="10"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniAttY", _default_val="-90"),
+            UIElement(_type=UIElementType.EDIT, _caption="StepAtt", _default_val="5"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniFile", _default_val="motion.avi"),
+            UIElement(_type=UIElementType.BUTTON, _caption="Animation", _default_val=self.Animation),
+            UIElement(_type=UIElementType.NEW_LINE),
         ]
         recon_subgrid, recon_dic = self.createGroupBox("Mesh up / Texture Overlay", recon_ele_list)
         self.ui_dic_list.append(recon_dic)
@@ -279,6 +299,17 @@ class Window(QWidget, UIBase):
         self.joystick_timer = QTimer(self)
         self.joystick_timer.start(100)
         self.joystick_timer.timeout.connect(self.joystick_timer_slot)
+
+        # Animation: 버튼 클릭 시에만 start()되는 타이머 (한 틱 = 한 스텝)
+        self._animation_timer = QTimer(self)
+        self._animation_timer.timeout.connect(self._animation_step)
+        self._ani_writer = None
+        self._ani_file   = None
+        self._ani_pos_x  = 0.0
+        self._ani_pos_z  = 0.0
+        self._ani_step_pos = 0.0
+        self._ani_att_y  = 0.0
+        self._ani_step_att = 0.0
 
     def register_auto_callbacks(self, click_cb, dblclick_cb):
         self._click_cb    = click_cb
@@ -785,6 +816,21 @@ class Window(QWidget, UIBase):
         SetGlobalPosition(px, py, pz)
         InitializeRenderFacet(-1, -1)
 
+    def ObjSetPosAtt(self):
+        _init_thalamus()
+        obj_id = self.get_ui_val("ObjID", int) or 0
+        px = self.get_ui_val("ObjPosX", float) or 0.0
+        py = self.get_ui_val("ObjPosY", float) or 0.0
+        pz = self.get_ui_val("ObjPosZ", float) or 0.0
+        ax = self.get_ui_val("ObjAttX", float) or 0.0
+        ay = self.get_ui_val("ObjAttY", float) or 0.0
+        az = self.get_ui_val("ObjAttZ", float) or 0.0
+
+        ret = SetObjectContextPosAtt(obj_id, px, py, pz, ax, ay, az)
+        if not ret:
+            print(f"ObjSetPosAtt: 실패 (ObjID={obj_id} - 존재하지 않거나 PUSH 구조가 안 맞음)")
+        InitializeRenderFacet(-1, -1)
+
     def ReconBirdView(self):
         for src, dst in (("Bird_PosX", "PosX"), ("Bird_PosY", "PosY"), ("Bird_PosZ", "PosZ"),
                          ("Bird_AttX", "AttX"), ("Bird_AttY", "AttY"), ("Bird_AttZ", "AttZ")):
@@ -872,11 +918,97 @@ class Window(QWidget, UIBase):
         getTextureImg(thread, TextuedView.ctypes, src_x, src_y, src_w, src_h, dest_w, dest_h, obj_id)
         cv2.imshow("Texture View", TextuedView)
         cv2.waitKey(1)
+        return TextuedView
+
+    # ── Animation : ObjPosZ/ObjAttY를 스텝만큼씩 움직이며 TextureView 프레임을 avi로 저장 ──
+    def _consume_ani_step(self, remaining, step):
+        # remaining(목표까지 남은 양)을 0 쪽으로 |step|만큼 줄이고, remaining과 같은
+        # 부호로 실제 적용해야 할 델타를 돌려준다. (remaining=-500, step=10 -> delta=-10, remaining=-490)
+        step = abs(step)
+        if step == 0.0 or remaining == 0.0:
+            return remaining, 0.0
+        mag = min(step, abs(remaining))
+        delta = mag if remaining > 0 else -mag
+        return remaining - delta, delta
+
+    def Animation(self):
+        if self._animation_timer.isActive():
+            print("Animation: 이미 실행 중")
+            return
+
+        ani_pos_x = self.get_ui_val("AniPosX", float) or 0.0
+        ani_pos_z = self.get_ui_val("AniPosZ", float) or 0.0
+        step_pos  = self.get_ui_val("StepPos", float) or 0.0
+        ani_att_y = self.get_ui_val("AniAttY", float) or 0.0
+        step_att  = self.get_ui_val("StepAtt", float) or 0.0
+
+        if (ani_pos_x != 0.0 or ani_pos_z != 0.0) and step_pos == 0.0:
+            print("Animation: StepPos가 0이라 AniPosX/AniPosZ를 소진할 수 없음")
+            return
+        if ani_att_y != 0.0 and step_att == 0.0:
+            print("Animation: StepAtt가 0이라 AniAttY를 소진할 수 없음")
+            return
+
+        self._ani_pos_x    = ani_pos_x
+        self._ani_pos_z    = ani_pos_z
+        self._ani_step_pos = step_pos
+        self._ani_att_y    = ani_att_y
+        self._ani_step_att = step_att
+        self._ani_file     = self._recon_path("AniFile")
+        self._ani_writer   = None
+
+        self._animation_timer.start(50)  # 한 틱(50ms)마다 한 스텝씩 진행, UI/타 타이머와 공존
+
+    def _animation_finish(self):
+        self._animation_timer.stop()
+        if self._ani_writer is not None:
+            self._ani_writer.release()
+            self._ani_writer = None
+            print(f"Animation: 저장 완료 ({self._ani_file})")
+
+    def _animation_step(self):
+        if self._ani_pos_x == 0.0 and self._ani_pos_z == 0.0 and self._ani_att_y == 0.0:
+            self._animation_finish()
+            return
+
+        self._ani_pos_x, delta_pos_x = self._consume_ani_step(self._ani_pos_x, self._ani_step_pos)
+        if delta_pos_x != 0.0:
+            obj_pos_x = (self.get_ui_val("ObjPosX", float) or 0.0) + delta_pos_x
+            self.set_ui_val("ObjPosX", f"{obj_pos_x:g}")
+        self.set_ui_val("AniPosX", f"{self._ani_pos_x:g}")
+
+        self._ani_pos_z, delta_pos = self._consume_ani_step(self._ani_pos_z, self._ani_step_pos)
+        if delta_pos != 0.0:
+            obj_pos_z = (self.get_ui_val("ObjPosZ", float) or 0.0) + delta_pos
+            self.set_ui_val("ObjPosZ", f"{obj_pos_z:g}")
+        self.set_ui_val("AniPosZ", f"{self._ani_pos_z:g}")
+
+        self._ani_att_y, delta_att = self._consume_ani_step(self._ani_att_y, self._ani_step_att)
+        if delta_att != 0.0:
+            obj_att_y = (self.get_ui_val("ObjAttY", float) or 0.0) + delta_att
+            self.set_ui_val("ObjAttY", f"{obj_att_y:g}")
+        self.set_ui_val("AniAttY", f"{self._ani_att_y:g}")
+
+        self.ObjSetPosAtt()
+        frame = self.ReconTexView()
+        if frame is None:
+            return
+
+        if self._ani_writer is None:
+            h, w = frame.shape[:2]
+            self._ani_writer = cv2.VideoWriter(self._ani_file, cv2.VideoWriter_fourcc(*"XVID"), 15.0, (w, h))
+            if not self._ani_writer.isOpened():
+                print(f"Animation: VideoWriter 열기 실패 ({self._ani_file})")
+                self._ani_writer = None
+        if self._ani_writer is not None:
+            self._ani_writer.write(frame)
 
     def quit_app(self):
         self.joystick_timer.stop()
         self.control_timer.stop()
         self.measure_timer.stop()
+        if self._animation_timer.isActive():
+            self._animation_finish()  # 진행 중인 avi가 있으면 release해서 파일 깨지지 않게 마무리
         cv2.destroyAllWindows()
         QApplication.quit()
 
