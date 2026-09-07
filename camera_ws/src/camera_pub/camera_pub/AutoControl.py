@@ -2,6 +2,8 @@ import os
 import time
 import sys
 import json
+import shutil
+import traceback
 from datetime import datetime
 import numpy as np
 import cv2
@@ -17,6 +19,7 @@ from PyQt5.QtCore import Qt, QTimer
 from camera_pub.img_proc_main import img_proc_odometry, get_last_optflow_pts, get_last_optflow_ids, get_optflow_reset_count, reset_optflow_pts, reset_vio, reset_optical_flow, get_last_vio_yaw
 from camera_pub.recon_util import pixel_to_vec
 from camera_pub.depth_recon import depthmap_floor_ransac, make_birdview
+from camera_pub.segmentation import predict_floor_ours as _predict_floor_ours
 
 from camera_pub.ui_base import UIBase, UIElementType, UIElement
 from ThalamusEngine.Interface import LoadThalamusInterface, InitEngine, Pixelto3D, Convert3DtoPixel
@@ -28,6 +31,11 @@ TRACK_MAX_PAN_STEP_DEG = 3.0
 TRACK_MAX_TILT_STEP_DEG = 3.0
 TRACK_PAN_DEADZONE_DEG = 2.0
 TRACK_TILT_DEADZONE_DEG = 2.0
+
+# act_get_local_birdview/repredict_tmp_localmap이 공유하는 (tilt_key, pan_key) 프리셋 순서.
+# still_shot.json에는 이 순서 그대로 한 위치당 6장씩 쌓이므로, repredict_tmp_localmap은
+# 그룹 안에서의 인덱스로 이 리스트를 거꾸로 찾아 그 shot의 pan_key를 알아낸다.
+LOCAL_VIEW_PRESETS = [("DN", "LL"), ("DN", "L"), ("DN", "N"), ("MD", "N"), ("DN", "R"), ("DN", "RR")]
 
 _ASM_FILE = os.path.join(os.path.expanduser("~/ros_workplace"), "ScriptFreeModel.txt").encode("UTF-8")
 _thalamus_ready = False
@@ -169,12 +177,17 @@ class PresetCamWindow(QWidget, UIBase):
             UIElement(_type=UIElementType.BUTTON, _caption="get_global_birdview",    _default_val=self.get_global_birdview),
             UIElement(_type=UIElementType.BUTTON, _caption="clear_tmp_localmap",     _default_val=self.clear_tmp_localmap),
 
+
             UIElement(_type=UIElementType.NEW_LINE),
-            UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
-            UIElement(_type=UIElementType.EDIT, _caption="gmap_oy", _default_val="0"),
-            UIElement(_type=UIElementType.EDIT,   _caption="scale_per1pix", _default_val="20"),
-            UIElement(_type=UIElementType.BUTTON, _caption="set_gram_param", _default_val=self.set_gram_param),
-            UIElement(_type=UIElementType.BUTTON, _caption="merge_on_globalmap", _default_val=self.merge_on_globalmap),
+            UIElement(_type=UIElementType.EDIT, _caption="floor_pos", _default_val="128,250"),
+            UIElement(_type=UIElementType.EDIT, _caption="floor_opt", _default_val="10,0.3"),
+            UIElement(_type=UIElementType.BUTTON, _caption="predict_floor_ours", _default_val=self.predict_floor_ours),
+            UIElement(_type=UIElementType.BUTTON, _caption="repredict_tmp_localmap", _default_val=self.repredict_tmp_localmap),
+            # UIElement(_type=UIElementType.EDIT, _caption="gmap_ox", _default_val="0"),
+            # UIElement(_type=UIElementType.EDIT, _caption="gmap_oy", _default_val="0"),
+            # UIElement(_type=UIElementType.EDIT,   _caption="scale_per1pix", _default_val="20"),
+            # UIElement(_type=UIElementType.BUTTON, _caption="set_gram_param", _default_val=self.set_gram_param),
+            # UIElement(_type=UIElementType.BUTTON, _caption="merge_on_globalmap", _default_val=self.merge_on_globalmap),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.BUTTON, _caption="image_proc_odometry", _default_val=self.image_proc_odometry),
             UIElement(_type=UIElementType.BUTTON, _caption="reset_vio",          _default_val=self.on_reset_vio),
@@ -400,6 +413,223 @@ class PresetCamWindow(QWidget, UIBase):
         cv2.imshow("Accumulated Bird View", self._acc_birdview)
         cv2.waitKey(1)
 
+    def predict_floor_ours(self):
+        """ThalamusRecon(recon_modeling.py)의 new_segmentation()에서 뽑아낸
+        floor mask 로직(camera_pub.segmentation.predict_floor_ours)을 현재 스트리밍
+        중인 rgb/depth에 대해 실행해본다. (우선 floor mask 결과만 확인하는 용도)"""
+        if not self.parent_window._streaming:
+            print("[predict_floor_ours] 스트리밍이 열려있지 않습니다.")
+            return
+        depth = self.parent_window.ros_node.depth_image
+        rgb   = self.parent_window.ros_node.rgb_image
+        if depth is None or rgb is None:
+            print("[predict_floor_ours] rgb/depth 이미지가 없습니다.")
+            return
+
+        try:
+            floor_x, floor_y = [int(v.strip()) for v in (self.get_ui_val("floor_pos") or "").split(",")]
+            floor_depth_th, floor_label_th = [float(v.strip()) for v in (self.get_ui_val("floor_opt") or "").split(",")]
+        except Exception:
+            print("[predict_floor_ours] floor_pos/floor_opt 파싱 실패 (예: floor_pos=128,250 floor_opt=10,0.3)")
+            return
+
+        depth_mm = depth * 1000.0  # m → mm
+
+        floor_label_mask, floor_vis, raugh_merged_labels, labels, _depth_resized = _predict_floor_ours(
+            rgb, depth_mm, (floor_x, floor_y), (floor_depth_th, floor_label_th),
+        )
+
+        print(f"[predict_floor_ours] floor pixel 수: {int(np.count_nonzero(floor_label_mask))}/{floor_label_mask.size}")
+        cv2.imshow("floor mask (ours)", floor_vis)
+        cv2.waitKey(1)
+
+    def repredict_tmp_localmap(self):
+        """tmp_local_view/still_shot/ 아래 저장해둔 still shot들(원본 rgb+depth)을 다시 읽어서
+        predict_floor_ours로 floor mask를 재계산하고, 그 결과로 Bird View를 새로 만든다.
+
+        still_shot.json은 act_get_local_birdview를 여러 번 실행한 기록이 순서대로 쌓여있으므로
+        (한 번 실행 = 로봇이 한 위치에 서서 LL/L/N/MD/R/RR 6장) odometry(x,y,yaw)가 바뀌는
+        지점마다 새 위치로 보고 그룹을 나눈다. 그룹별로 각각 Bird View를 합성해서
+        tmp_local_view/birdview00.png/json, birdview01.png/json, ... 로 덮어쓴다
+        (그룹 개수만큼 00부터 다시 채움. 예전에 이 이상 번호로 있던 birdview 파일은 안 건드림).
+
+        (still_shot에는 카메라 pan 각도가 안 저장돼 있어서, cam_heading은 저장된
+        attitude.yaw로 근사한다 - act_get_local_birdview 당시의 PanningAngle-N과는 다를 수 있음)"""
+        base_dir = os.path.expanduser('~/ros_workplace/tmp_local_view')
+        manifest_path = os.path.join(base_dir, 'still_shot.json')
+        if not os.path.exists(manifest_path):
+            print(f"[repredict_tmp_localmap] {manifest_path} 없음")
+            return
+        try:
+            with open(manifest_path, 'r') as f:
+                records = json.load(f)
+        except Exception as e:
+            print(f"[repredict_tmp_localmap] {manifest_path} 읽기 실패: {e}")
+            return
+        if not records:
+            print("[repredict_tmp_localmap] still_shot.json에 기록된 shot이 없습니다.")
+            return
+
+        try:
+            floor_x, floor_y = [int(v.strip()) for v in (self.get_ui_val("floor_pos") or "").split(",")]
+            floor_depth_th, floor_label_th = [float(v.strip()) for v in (self.get_ui_val("floor_opt") or "").split(",")]
+        except Exception:
+            print("[repredict_tmp_localmap] floor_pos/floor_opt 파싱 실패 (예: floor_pos=128,250 floor_opt=10,0.3)")
+            return
+        close_iter = int(self.get_ui_val("close_iter") or 3)
+        n_neutral  = self.get_ui_val("N", float) or 0.0  # 패닝 중립(정면) 기준값
+
+        # +위치(odometry)가 바뀌는 지점마다 그룹으로 나눈다 (같은 위치에서 찍은 LL/L/N/MD/R/RR끼리 묶음)
+        pos_tol_xy  = 0.05   # m
+        pos_tol_yaw = 1.0    # deg
+
+        def _same_pos(o1, o2):
+            return (abs(o1.get("x", 0.0) - o2.get("x", 0.0)) <= pos_tol_xy and
+                    abs(o1.get("y", 0.0) - o2.get("y", 0.0)) <= pos_tol_xy and
+                    abs(o1.get("yaw", 0.0) - o2.get("yaw", 0.0)) <= pos_tol_yaw)
+
+        groups = []
+        for rec in records:
+            odom = rec.get("odometry") or {}
+            if groups and _same_pos(groups[-1][0].get("odometry") or {}, odom):
+                groups[-1].append(rec)
+            else:
+                groups.append([rec])
+        # -위치 그룹 나누기
+
+        print(f"[repredict_tmp_localmap] shot {len(records)}개 -> 위치 {len(groups)}개로 그룹화됨")
+
+        written = 0
+        for g_idx, group in enumerate(groups):
+            acc_birdview = None
+            last_odometry = {}
+            last_attitude = {}
+            group_processed = 0
+
+            for shot_idx, rec in enumerate(group):
+                shot_rel = rec.get("still_shot")
+                if not shot_rel:
+                    continue
+                shot_dir   = os.path.join(base_dir, shot_rel)
+                img_path   = os.path.join(shot_dir, "img.png")
+                depth_path = os.path.join(shot_dir, "depth.bin")
+                if not (os.path.isfile(img_path) and os.path.isfile(depth_path)):
+                    print(f"[repredict_tmp_localmap] {shot_dir} 안에 img.png/depth.bin이 없어 건너뜀")
+                    continue
+
+                rgb = cv2.imread(img_path)
+                if rgb is None:
+                    print(f"[repredict_tmp_localmap] {img_path} 로드 실패")
+                    continue
+
+                # still_shot 저장 당시 depth.bin의 shape(H,W)을 몰라서, 기록이 없으면(구버전 캡처)
+                # 이 카메라의 depth 해상도(256x256) 고정값으로 가정한다.
+                depth_shape = rec.get("depth_shape")
+                if depth_shape:
+                    dh, dw = int(depth_shape[0]), int(depth_shape[1])
+                else:
+                    dh, dw = 256, 256
+
+                depth_flat = np.fromfile(depth_path, dtype=np.float32)
+                if depth_flat.size != dh * dw:
+                    print(f"[repredict_tmp_localmap] {depth_path} 크기({depth_flat.size})가 "
+                          f"{dh}x{dw}={dh * dw}와 안 맞아 건너뜀")
+                    continue
+                depth_mm = depth_flat.reshape(dh, dw)  # still_shot()이 이미 mm 단위로 저장해둠
+
+                att  = rec.get("attitude")  or {}
+                odom = rec.get("odometry")  or {}
+                cam_roll  = float(att.get("roll", 0.0))
+                cam_pitch = float(att.get("pitch", 0.0))
+
+                # cam_heading은 attitude.yaw(IMU 실측)를 못 믿겠다고 하셔서, 대신 이 shot이
+                # 찍힌 프리셋의 pan 각도(중립 N 기준 상대값)로 계산한다. shot이 그룹 안에서
+                # 몇 번째인지로 LOCAL_VIEW_PRESETS에서 그 pan_key를 거꾸로 찾는다
+                # (still_shot.json이 항상 이 순서로 6장씩 쌓이므로).
+                # 주의: 여기에 odom_yaw는 더하지 않는다 - birdviewNN.png는 항상 "로봇 기준
+                # 프레임"으로 그려야 하고, world(오도메트리) 프레임 변환은 get_global_birdview/
+                # merge_on_globalmap이 birdview_json의 odometry.yaw로 따로 처리한다.
+                # 여기서 odom_yaw까지 더해버리면 그쪽에서 odom_yaw가 다시 곱해져 이중 회전된다.
+                if shot_idx < len(LOCAL_VIEW_PRESETS):
+                    pan_key = LOCAL_VIEW_PRESETS[shot_idx][1]
+                    pan_angle = self.get_ui_val(pan_key, float)
+                else:
+                    pan_key, pan_angle = None, None
+
+                if pan_angle is None:
+                    print(f"[repredict_tmp_localmap] {shot_rel}: pan preset('{pan_key}') 값을 못 읽어서 "
+                          f"attitude.yaw로 대체")
+                    cam_heading = float(att.get("yaw", 0.0))
+                else:
+                    cam_heading = pan_angle - n_neutral
+
+                _t_shot0 = time.time()
+                try:
+                    floor_label_mask, floor_vis, raugh_merged_labels, labels, depth_resized = _predict_floor_ours(
+                        rgb, depth_mm, (floor_x, floor_y), (floor_depth_th, floor_label_th),
+                    )
+                except Exception:
+                    print(f"[repredict_tmp_localmap] {shot_rel} floor mask 재계산 중 예외 발생 (건너뜀):")
+                    traceback.print_exc()
+                    continue
+                _t_shot1 = time.time()
+                print(f"[repredict_tmp_localmap][timing] {shot_rel} predict_floor_ours 총: {_t_shot1 - _t_shot0:.3f}s")
+
+                # floor_label_mask(라벨 해상도) -> make_birdview가 기대하는 dense (h,w,3) 포인트맵으로 변환
+                label_h, label_w = labels.shape
+                floor_pts_map = np.zeros((label_h, label_w, 3), dtype=np.float32)
+                ys, xs = np.where(floor_label_mask)
+                for py, px in zip(ys, xs):
+                    floor_pts_map[py, px] = pixel_to_vec(px, py, (720, 1280), depth_resized)
+                _t_shot2 = time.time()
+                print(f"[repredict_tmp_localmap][timing] {shot_rel} floor_pts_map용 pixel_to_vec 루프: "
+                      f"{_t_shot2 - _t_shot1:.3f}s ({len(ys)}개 픽셀)")
+
+                birdview = make_birdview(floor_pts_map, cam_pitch, cam_roll, close_iter=close_iter,
+                                         cam_heading=cam_heading, cam_axis_pos=100.0)
+                _t_shot3 = time.time()
+                print(f"[repredict_tmp_localmap][timing] {shot_rel} make_birdview: {_t_shot3 - _t_shot2:.3f}s "
+                      f"(shot 전체: {_t_shot3 - _t_shot0:.3f}s)")
+
+                if acc_birdview is None or acc_birdview.shape != birdview.shape:
+                    acc_birdview = np.zeros_like(birdview)
+                acc_birdview = cv2.bitwise_or(acc_birdview, birdview)
+
+                last_odometry = odom
+                last_attitude = att
+                group_processed += 1
+                print(f"[repredict_tmp_localmap] group{g_idx:02d} {shot_rel} 재계산 완료 "
+                      f"(floor px={int(np.count_nonzero(floor_label_mask))})")
+
+            if acc_birdview is None or group_processed == 0:
+                print(f"[repredict_tmp_localmap] group{g_idx:02d}: 재계산된 shot이 없어 건너뜀")
+                continue
+
+            png_path  = os.path.join(base_dir, f'birdview{g_idx:02d}.png')
+            json_path = os.path.join(base_dir, f'birdview{g_idx:02d}.json')
+            data = {
+                "timestamp":    datetime.now().strftime('%Y%m%d_%H%M%S'),
+                "odometry":     {"x": last_odometry.get("x", 0.0), "y": last_odometry.get("y", 0.0), "yaw": last_odometry.get("yaw", 0.0)},
+                "attitude":     {"roll": last_attitude.get("roll", 0.0), "pitch": last_attitude.get("pitch", 0.0), "yaw": last_attitude.get("yaw", 0.0)},
+                "birdview_png": f'birdview{g_idx:02d}.png',
+            }
+            cv2.imwrite(png_path, acc_birdview)
+            with open(json_path, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            self._acc_birdview = acc_birdview  # 마지막 그룹 결과를 화면에도 띄워둠
+            written += 1
+            print(f"[repredict_tmp_localmap] group{g_idx:02d}: shot {group_processed}개로 재계산 완료 "
+                  f"-> {png_path}, {json_path} 덮어씀")
+
+        if written == 0:
+            print("[repredict_tmp_localmap] 재계산된 그룹이 없습니다.")
+            return
+
+        cv2.imshow("Accumulated Bird View", self._acc_birdview)
+        cv2.waitKey(1)
+        print(f"[repredict_tmp_localmap] 총 {written}개 위치(birdview00~{written-1:02d}) 재생성 완료")
+
     def clr_acc_bird_view(self):
         if not hasattr(self, '_acc_birdview'):
             print("[clr_acc_bird_view] 누적된 Bird View가 없습니다.")
@@ -410,19 +640,27 @@ class PresetCamWindow(QWidget, UIBase):
 
     def act_get_local_birdview(self):
         """카메라를 LL→L→N→R→RR (틸트 DN 고정) 순서로 돌리며 매 위치마다
-        stable_time(ms) 만큼 정착 대기 후 predict_floor_ransac을 실행,
-        Accumulated Bird View에 누적한다."""
+        stable_time(ms) 만큼 정착 대기 후 still_shot(원본 rgb+depth 저장)을 찍고,
+        이어서 predict_floor_ransac을 실행해 Accumulated Bird View에 누적한다.
+        still_shot 저장 중 문제가 생겨도 predict_floor_ransac/누적은 계속 진행된다."""
         self.clr_acc_bird_view()
 
         stable_ms  = self.get_ui_val("stable_time(ms)", float)
         stable_sec = (stable_ms if stable_ms is not None else 500.0) / 1000.0
 
-        presets = [("DN", "LL"), ("DN", "L"), ("DN", "N"), ("MD", "N"),  ("DN", "R"), ("DN", "RR")]
+        presets = LOCAL_VIEW_PRESETS
         for tilt_key, pan_key in presets:
             print(f"[act_get_local_birdview] preset tilt={tilt_key} pan={pan_key}, "
-                  f"stable_time={stable_sec:.2f}s 대기 후 predict_floor_ransac")
+                  f"stable_time={stable_sec:.2f}s 대기 후 still_shot -> predict_floor_ransac")
             self.preset_control(tilt_key, pan_key)
             time.sleep(stable_sec)
+
+            try:
+                self._local_view_still_shot()
+            except Exception:
+                print("[act_get_local_birdview] still_shot 저장 중 예외 발생 (무시하고 계속 진행):")
+                traceback.print_exc()
+
             self.predict_floor_ransac()
 
         if hasattr(self, '_acc_birdview'):
@@ -431,6 +669,62 @@ class PresetCamWindow(QWidget, UIBase):
 
         self._save_local_birdview()
         print("[act_get_local_birdview] 완료")
+
+    def _local_view_still_shot(self):
+        """tmp_local_view/still_shot/ 아래에 현재 프레임을 still_shot으로 저장하고,
+        타임스탬프/오도메트리 위치(x,y,yaw)/자세(roll,pitch,yaw)/still shot 경로를
+        tmp_local_view/still_shot.json에 누적 기록한다."""
+        base_dir  = os.path.expanduser('~/ros_workplace/tmp_local_view')
+        shot_root = os.path.join(base_dir, 'still_shot')
+        os.makedirs(shot_root, exist_ok=True)
+
+        idx = 0
+        while os.path.exists(os.path.join(shot_root, f'shot{idx:02d}')):
+            idx += 1
+        shot_dir = os.path.join(shot_root, f'shot{idx:02d}')
+
+        pw = self.parent_window
+        saved_dir = pw.still_shot(save_dir=shot_dir)
+        if not saved_dir:
+            print("[act_get_local_birdview] still_shot 저장 실패 (rgb 없음)")
+            return
+
+        odom_x   = pw.odom_x[-1]   if pw.odom_x   else 0.0
+        odom_y   = pw.odom_y[-1]   if pw.odom_y   else 0.0
+        odom_yaw = pw.odom_yaw[-1] if pw.odom_yaw else 0.0
+
+        att = pw.ros_node.attitude
+        cam_roll  = float(att.x) if att is not None else 0.0
+        cam_pitch = float(att.y) if att is not None else 0.0
+        cam_yaw   = float(att.z) if att is not None else 0.0
+
+        # depth.bin은 shape 정보 없이 raw float32로 저장되므로, 나중에(repredict_tmp_localmap)
+        # 다시 읽을 때 reshape할 수 있도록 캡처 당시의 depth 해상도를 같이 남겨둔다.
+        depth_img = pw.ros_node.depth_image
+        depth_shape = list(depth_img.shape) if depth_img is not None else None
+
+        entry = {
+            "timestamp":   datetime.now().strftime('%Y%m%d_%H%M%S'),
+            "odometry":    {"x": odom_x, "y": odom_y, "yaw": odom_yaw},
+            "attitude":    {"roll": cam_roll, "pitch": cam_pitch, "yaw": cam_yaw},
+            "still_shot":  os.path.relpath(saved_dir, base_dir),
+            "depth_shape": depth_shape,
+        }
+
+        json_path = os.path.join(base_dir, 'still_shot.json')
+        records = []
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r') as f:
+                    records = json.load(f)
+            except Exception:
+                print(f"[act_get_local_birdview] {json_path} 읽기 실패, 새로 만듭니다.")
+                records = []
+        records.append(entry)
+        with open(json_path, 'w') as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+
+        print(f"[act_get_local_birdview] still_shot 저장: {entry['still_shot']}")
 
     def _save_local_birdview(self):
         """tmp_local_view/birdviewNN.png + birdviewNN.json 으로
@@ -553,7 +847,8 @@ class PresetCamWindow(QWidget, UIBase):
               f"({g_w}x{g_h}, {mm_per_px:.0f}mm/px) → {save_path}")
 
     def clear_tmp_localmap(self):
-        """tmp_local_view 디렉토리 안의 birdview*.png/json, global_birdview.png를 모두 삭제."""
+        """tmp_local_view 디렉토리 안의 birdview*.png/json, global_birdview.png,
+        still_shot.json, still_shot/ 디렉토리를 모두 삭제."""
         load_dir = os.path.expanduser('~/ros_workplace/tmp_local_view')
         if not os.path.isdir(load_dir):
             print(f"[clear_tmp_localmap] {load_dir} 없음")
@@ -561,9 +856,18 @@ class PresetCamWindow(QWidget, UIBase):
 
         removed = 0
         for fname in os.listdir(load_dir):
+            fpath = os.path.join(load_dir, fname)
+            if os.path.isdir(fpath):
+                if fname == 'still_shot':
+                    try:
+                        shutil.rmtree(fpath)
+                        removed += 1
+                    except OSError as e:
+                        print(f"[clear_tmp_localmap] {fname}/ 삭제 실패: {e}")
+                continue
             if fname.endswith('.png') or fname.endswith('.json'):
                 try:
-                    os.remove(os.path.join(load_dir, fname))
+                    os.remove(fpath)
                     removed += 1
                 except OSError as e:
                     print(f"[clear_tmp_localmap] {fname} 삭제 실패: {e}")

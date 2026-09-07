@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from camera_pub.recon_util import pixel_to_vec, rotate_rpy
+from camera_pub.recon_util import pixel_to_vec
 
 
 def depthmap_floor_ransac(depth_mm, target_shape, dist_th, cam_pitch=0.0, cam_roll=0.0,
@@ -116,19 +116,32 @@ def make_birdview(mask, cam_pitch=0.0, cam_roll=0.0, img_size=512, scale=0.05, c
     cx = img_size // 2
     cy = int(img_size * 0.8)  # 로봇 회전축 기준
 
-    h, w = mask.shape[:2]
-    for py in range(h):
-        for px in range(w):
-            pt_cam = mask[py, px]
-            if pt_cam[2] <= 0:
-                continue
-            # roll + pitch + heading 한번에 회전 → 로봇 프레임
-            pt_world = rotate_rpy(pt_cam, cam_roll, cam_pitch, cam_heading)
-            # 카메라가 로봇 축에서 cam_axis_pos mm 전방에 있으므로 Z 보정
-            bv_x = int(cx + pt_world[0] * scale)
-            bv_y = int(cy - (pt_world[2] + cam_axis_pos) * scale)
-            if 0 <= bv_x < img_size and 0 <= bv_y < img_size:
-                bv[bv_y, bv_x] = (255, 255, 255)
+    # cam_roll/cam_pitch/cam_heading은 호출 한 번에 대해 고정값이라 회전행렬 R은 한 번만
+    # 만들면 되는데, 원래 구현은 픽셀마다(rotate_rpy 호출마다) R을 매번 새로 만들고
+    # 픽셀 하나짜리 파이썬 루프(최대 h*w번)를 돌아서 300x300 기준 1~3초씩 걸렸다.
+    # 여기서는 R을 한 번만 만들고 유효 픽셀 전체를 한 번의 행렬곱으로 처리한다(결과 동일).
+    r = np.deg2rad(cam_roll)
+    p = np.deg2rad(cam_pitch)
+    y = np.deg2rad(cam_heading)
+    Rz = np.array([[np.cos(r), -np.sin(r), 0],
+                   [np.sin(r),  np.cos(r), 0],
+                   [0,          0,          1]])
+    Rx = np.array([[1, 0,          0         ],
+                   [0, np.cos(p), -np.sin(p) ],
+                   [0, np.sin(p),  np.cos(p) ]])
+    Ry = np.array([[np.cos(y),  0, np.sin(y)],
+                   [0,          1, 0         ],
+                   [-np.sin(y), 0, np.cos(y)]])
+    R = Ry @ Rx @ Rz  # rotate_rpy(vec, cam_roll, cam_pitch, cam_heading)와 동일한 R
+
+    pts_flat = mask.reshape(-1, 3).astype(np.float64)
+    valid = pts_flat[:, 2] > 0
+    pts_world = (R @ pts_flat[valid].T).T  # (M, 3) - rotate_rpy를 픽셀별로 부른 것과 동일
+
+    bv_x = (cx + pts_world[:, 0] * scale).astype(np.int64)
+    bv_y = (cy - (pts_world[:, 2] + cam_axis_pos) * scale).astype(np.int64)
+    in_bounds = (bv_x >= 0) & (bv_x < img_size) & (bv_y >= 0) & (bv_y < img_size)
+    bv[bv_y[in_bounds], bv_x[in_bounds]] = (255, 255, 255)
 
     if close_iter > 0:
         kernel = np.ones((3, 3), np.uint8)

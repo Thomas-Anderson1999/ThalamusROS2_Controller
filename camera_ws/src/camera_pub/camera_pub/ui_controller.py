@@ -363,11 +363,11 @@ class Window(QWidget, UIBase):
         self._streaming_window.show()
         self._streaming = True
 
-    def still_shot(self):
+    def still_shot(self, save_dir=None):
         rgb = self.ros_node.rgb_image
         if rgb is None:
             self.ros_node.get_logger().warn('still_shot: no rgb image available')
-            return
+            return None
 
         # MinMaxDepth: "min:max" (mm) - depth_image 자체는 m 단위라 비교 전에 변환
         min_max_str = self.get_ui_val("MinMaxDepth") or "600:6000"
@@ -414,10 +414,11 @@ class Window(QWidget, UIBase):
 
         import os
         from datetime import datetime
-        save_dir = os.path.join(
-            os.path.expanduser('~/ros_workplace/still_shots'),
-            datetime.now().strftime('%Y%m%d_%H%M%S')
-        )
+        if not save_dir:  # 버튼 클릭 시 PyQt가 checked(bool)=False를 넘겨줄 수 있어 not으로 처리
+            save_dir = os.path.join(
+                os.path.expanduser('~/ros_workplace/still_shots'),
+                datetime.now().strftime('%Y%m%d_%H%M%S')
+            )
         os.makedirs(save_dir, exist_ok=True)
         cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
 
@@ -446,6 +447,8 @@ class Window(QWidget, UIBase):
                 d_vis = np.zeros_like(d_vis, dtype=np.uint8)
             cv2.imshow("Still Shot - Depth(avg)", cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
         cv2.waitKey(1)
+
+        return save_dir
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
