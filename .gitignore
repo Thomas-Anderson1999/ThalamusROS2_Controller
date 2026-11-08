@@ -9,3 +9,10 @@ camera_ws/install
 .idea/
 __pycache__/
 *.pyc
+
+# data / personal
+Dataset/
+video_shot/
+still_shots/
+tmp_local_view/
+memo.txt

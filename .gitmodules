@@ -1,0 +1,6 @@
+[submodule ".conventions/thalamus"]
+	path = .conventions/thalamus
+	url = https://github.com/Thomas-Anderson1999/ThalamusAgentConvention
+[submodule "camera_ws/src/camera_pub/camera_pub/ThalamusCV"]
+	path = camera_ws/src/camera_pub/camera_pub/ThalamusCV
+	url = https://github.com/Thomas-Anderson1999/ThalamusCV

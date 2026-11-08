@@ -1,0 +1,9 @@
+커밋 제목: [ThalamusROS2_Controller][2026-11-08] 개발환경 세팅 및 저장소 정리
+왜: 새 PC에서 ui_controller 실행 환경을 재현할 수 있게 하고, 저장소에 섞인 빌드 산출물/데이터를 정리하기 위해
+무엇을:
+- .conventions/thalamus(ThalamusAgentConvention) 서브모듈 추가
+- ThalamusCV 서브모듈 매핑을 .gitmodules에 추가 (gitlink만 있고 매핑이 없어 clone 시 비어있던 문제)
+- CLAUDE.md, requirements.txt 추가 (venv: --system-site-packages, numpy<2, opencv headless, torch cu126, ThalamusEngine 0.3.4 로컬 빌드)
+- .gitignore에 Dataset/, video_shot/, still_shots/, tmp_local_view/, memo.txt 추가
+- 추적되던 __pycache__/*.pyc 인덱스에서 제거
+
