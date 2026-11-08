@@ -6,3 +6,16 @@ venv
 camera_ws/build
 camera_ws/log
 camera_ws/install
+.idea/
+__pycache__/
+*.pyc
+
+# data / personal
+Dataset/
+video_shot/
+still_shots/
+tmp_local_view/
+memo.txt
+
+# CNN 가중치 (용량 문제로 git 기록에서 제거, 별도 배포)
+camera_ws/src/camera_pub/camera_pub/cnn_weight/*.pt

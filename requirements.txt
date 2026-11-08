@@ -1,0 +1,15 @@
+# venv 생성: python3.12 -m venv --system-site-packages venv  (rclpy/cv_bridge는 /opt/ros/jazzy 시스템 패키지 사용)
+# torch는 GTX1050(sm_61) 대응 cu126 빌드: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+numpy<2  # ROS Jazzy cv_bridge 호환 (시스템 1.26.4 사용)
+opencv-contrib-python-headless==4.11.0.86  # headless 필수: 일반판의 Qt 플러그인이 PyQt5와 충돌
+opencv-python-headless==4.11.0.86
+pygame==2.6.1
+pyqtgraph==0.14.0
+ruff==0.17.4
+scikit-image==0.26.0
+# ThalamusEngine 0.3.4 (PyPI 최신 0.3.3에는 SetObjectContextPosAtt 없음) → 로컬 빌드 wheel 설치:
+#   cd ~/thalamus_workplace/05.ThalamusVisualRecognition/ThalamusEngine && make lib && make whl  (apt: libglut-dev 필요)
+#   pip install --no-deps dist/thalamusengine-0.3.4-py3-none-any.whl
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126
+ultralytics==8.4.207

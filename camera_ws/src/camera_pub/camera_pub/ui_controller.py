@@ -1,0 +1,1326 @@
+import sys
+import os
+import json
+import time
+import copy
+import threading
+import numpy as np
+import cv2
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+
+from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QTabWidget, QVBoxLayout
+from PyQt5.QtCore import QTimer, Qt
+
+from camera_pub.ui_base import UIBase, UIElementType, UIElement
+from camera_pub.ui_utils import StreamingWindow
+from camera_pub.ThalamusJoystick import ThalamusJoystick
+from camera_pub import AutoControl as _auto_control
+from camera_pub.AutoControl import (
+    PresetCamWindow, _init_thalamus,
+    meter_per_enc, rotate_pi_per_enc, get_tilt_servo_angle,
+)
+from camera_pub.img_proc_main import stop_vio, set_vio_cmd_type, get_last_vio_yaw
+from ThalamusEngine.Interface import (
+    ObjMeshUp, TexureOveray, TextureInterpolation, getTextureImg,
+    LoadBinDepthMapPnt, InitializeRenderFacet,
+    LoadThalamusInterface, InitEngine, StartExt3DEngine,
+    SetGlobalPosition, SetGlobalAttitude, SetObjectContextPosAtt,
+)
+from std_msgs.msg import String
+from geometry_msgs.msg import Vector3
+from sensor_msgs.msg import CompressedImage, Image
+from serial_interfaces.srv import SerialBypass
+
+
+class UIControllerNode(Node):
+    def __init__(self):
+        super().__init__('ui_controller')
+        self.cli = self.create_client(SerialBypass, 'serial_bypass')
+        self.create_subscription(String, 'serial_message', self._on_serial_msg, 10)
+        self.create_subscription(Vector3, 'camera_attitude', self._on_attitude, 10)
+
+        self.attitude    = None  # Vector3
+        self.motion_data = None  # (enc1, enc2, spd1, spd2, stat1, stat2)
+        self.rgb_image   = None  # numpy BGR
+        self.depth_image = None  # numpy float32
+
+        # 발행측(camera_node_d455i)과 동일하게 BEST_EFFORT + KEEP_LAST 1
+        stream_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(CompressedImage, '/camera/rgb/compressed', self._on_rgb, stream_qos)
+        self.create_subscription(Image, '/camera/depth', self._on_depth, stream_qos)
+
+    def _on_serial_msg(self, msg):
+        print(f'[serial] {msg.data}')
+        try:
+            parts = msg.data.replace('\t', ' ').split()
+            if len(parts) >= 8 and parts[0].startswith('PF>'):
+                enc1  = -int(parts[0].replace('PF>', ''))
+                enc2  =  int(parts[1])
+                spd1  = -int(parts[2])
+                spd2  =  int(parts[3])
+                stat1 =  int(parts[6])
+                stat2 =  int(parts[7])
+                self.motion_data = (enc1, enc2, spd1, spd2, stat1, stat2)
+        except Exception:
+            pass
+
+    def _on_attitude(self, msg):
+        self.attitude = msg
+
+    def _on_rgb(self, msg):
+        arr = np.frombuffer(msg.data, np.uint8)
+        self.rgb_image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def _on_depth(self, msg):
+        self.depth_image = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
+
+    def send_serial(self, raw_str):
+        if not self.cli.service_is_ready():
+            self.get_logger().warn(f'serial_bypass not ready, dropped: {raw_str}')
+            return
+        req = SerialBypass.Request()
+        req.data = '%-30sXX' % raw_str
+        future = self.cli.call_async(req)
+        future.add_done_callback(lambda f: self._on_done(f, raw_str))
+
+    def _on_done(self, future, raw_str):
+        try:
+            res = future.result()
+            if not res.success:
+                self.get_logger().error(f'send failed [{raw_str}]: {res.message}')
+        except Exception as e:
+            self.get_logger().error(f'service call error: {e}')
+
+
+class Window(QWidget, UIBase):
+    def __init__(self, ros_node: UIControllerNode):
+        super(Window, self).__init__()
+        UIBase.__init__(self)
+
+        self.ros_node = ros_node
+        self.mainGrid = QGridLayout()
+        self.ui_dic_list = []
+
+        # ── basic control ──────────────────────────────────────
+        start_ele_list = [
+            UIElement(_type=UIElementType.BUTTON, _caption="SavePreset",    _default_val=self.SavePreset),
+            UIElement(_type=UIElementType.BUTTON, _caption="LoadPreset",    _default_val=self.LoadPreset),
+            UIElement(_type=UIElementType.BUTTON, _caption="Quit",          _default_val=self.quit_app),
+            UIElement(_type=UIElementType.BUTTON, _caption="Auto-control", _default_val=self.focus_auto_window),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="SendStr",       _default_val=""),
+            UIElement(_type=UIElementType.BUTTON, _caption="SendStr",       _default_val=self.SendStr),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="TiltAngle",     _default_val="45"),
+            UIElement(_type=UIElementType.BUTTON, _caption="SetTilt",       _default_val=self.SetTilt),
+            UIElement(_type=UIElementType.EDIT,   _caption="PanningAngle",  _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="SetPanning",    _default_val=self.SetPanning),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="MVSpd",         _default_val="1600"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Distance",      _default_val="500"),
+            UIElement(_type=UIElementType.EDIT,   _caption="RotSpd",        _default_val="600"),
+            UIElement(_type=UIElementType.EDIT,   _caption="RotAngle",      _default_val="90"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="MotCancel",     _default_val=self.MotCancel),
+            UIElement(_type=UIElementType.BUTTON, _caption="MoveFoward",    _default_val=lambda _checked=False: self.MoveFoward()),
+            UIElement(_type=UIElementType.BUTTON, _caption="MoveBackward",  _default_val=lambda _checked=False: self.MoveBackward()),
+            UIElement(_type=UIElementType.BUTTON, _caption="RotateLeft",    _default_val=lambda _checked=False: self.RotateLeft()),
+            UIElement(_type=UIElementType.BUTTON, _caption="RotateRight",   _default_val=lambda _checked=False: self.RotateRight()),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
+        subgrid, start_dic = self.createGroupBox("basic control", start_ele_list)
+        self.ui_dic_list.append(start_dic)
+        self.mainGrid.addWidget(subgrid, 0, 0)
+
+        # ── communication ──────────────────────────────────────
+        start_ele_list = [
+            UIElement(_type=UIElementType.BUTTON, _caption="open_streaming",  _default_val=self.open_streaming),
+
+            UIElement(_type=UIElementType.EDIT, _caption="MinMaxDepth", _default_val="600:6000"),
+            UIElement(_type=UIElementType.EDIT, _caption="AvgCnt", _default_val="10"),
+            UIElement(_type=UIElementType.BUTTON, _caption="still_shot",      _default_val=self.still_shot),
+
+            UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry",  _default_val=self.reset_odometry),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="vidrec_start",    _default_val=self.vidrec_start),
+            UIElement(_type=UIElementType.BUTTON, _caption="vidrec_stop",     _default_val=self.vidrec_stop),
+            UIElement(_type=UIElementType.EDIT,   _caption="frame_idx",       _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="get_vid",         _default_val=self.get_vid),
+            UIElement(_type=UIElementType.EDIT,   _caption="vid_avgcnt",      _default_val="10"),
+            UIElement(_type=UIElementType.BUTTON, _caption="save_slice",      _default_val=self.save_slice),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="camera_pitch", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="camera_yaw",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="odom_yaw",     _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT, _caption="enc1",  _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="enc2",  _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="spd1",  _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="spd2",  _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="stat1", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="stat2", _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
+        subgrid, start_dic = self.createGroupBox("communication", start_ele_list)
+        self.ui_dic_list.append(start_dic)
+        self.mainGrid.addWidget(subgrid, 1, 0)
+
+        # ── graph ──────────────────────────────────────────────
+        start_ele_list = [
+            UIElement(_type=UIElementType.GRAPH_1D, _caption="Graph1D_Enc",          _default_val=None, _defalt_row=1),
+            UIElement(_type=UIElementType.GRAPH_1D, _caption="Graph1D_DistYaw",      _default_val=None, _defalt_row=1),
+            UIElement(_type=UIElementType.GRAPH_2D_TRAJECTORY, _caption="Trajectory",_default_val=None, _defalt_row=1),
+        ]
+        subgrid, start_dic = self.createGroupBox("Graph Enc/Dist_Yaw/Trajectory", start_ele_list)
+        self.ui_dic_list.append(start_dic)
+        self.mainGrid.addWidget(subgrid, 2, 0)
+        self.mainGrid.setRowMinimumHeight(2, 300)
+
+        # ── Reconstruction (Mesh up / Texture Overlay) ─────────
+        recon_ele_list = [
+            UIElement(_type=UIElementType.EDIT,   _caption="WorkingDir",      _default_val="~/ros_workplace"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconScriptFile", _default_val="ScriptFreeModel.txt"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconEngineName",  _default_val="Thalamus Reconstruction"),
+            UIElement(_type=UIElementType.BUTTON, _caption="Engine Start",     _default_val=self.ReconEngineStart),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconDepthBin",  _default_val="Dataset/Dataset03/DepthBin03.txt"),
+            UIElement(_type=UIElementType.EDIT, _caption="DepthWidth", _default_val="256"),
+            UIElement(_type=UIElementType.EDIT, _caption="Deptheight", _default_val="256"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconColorImg",  _default_val="Dataset/Dataset03/Color03.png"),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="ReconWidth", _default_val="300"),
+            UIElement(_type=UIElementType.EDIT, _caption="ReconHeight", _default_val="300"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconMeshUpInv", _default_val="9"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconFreeModelNum", _default_val="5"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconThread",    _default_val="12"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcPosX",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcPosY",   _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcWidth",  _default_val="1280"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconSrcHeight", _default_val="720"),
+            UIElement(_type=UIElementType.EDIT,   _caption="ReconObjID",     _default_val="-1"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="MeshUp",          _default_val=self.ReconMeshUp),
+            UIElement(_type=UIElementType.BUTTON, _caption="Texture Overlay", _default_val=self.ReconTexOverlay),
+            #UIElement(_type=UIElementType.BUTTON, _caption="Texture Int",     _default_val=self.ReconTexInt),
+            UIElement(_type=UIElementType.BUTTON, _caption="TextureView",     _default_val=self.ReconTexView),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT,   _caption="PosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="PosY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="PosZ", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="AttZ", _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="SetPosAtt", _default_val=self.ReconSetPosAtt),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosY", _default_val="8000"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_PosZ", _default_val="-3000"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttX", _default_val="90"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT,   _caption="Bird_AttZ", _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="BirdView", _default_val=self.ReconBirdView),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="ObjID", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjPosZ", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttY", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="ObjAttZ", _default_val="0"),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="ObjSetPosAtt", _default_val=self.ObjSetPosAtt),
+            UIElement(_type=UIElementType.NEW_LINE),
+
+            UIElement(_type=UIElementType.EDIT, _caption="AniPosX", _default_val="0"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniPosZ", _default_val="-500"),
+            UIElement(_type=UIElementType.EDIT, _caption="StepPos", _default_val="10"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniAttY", _default_val="-90"),
+            UIElement(_type=UIElementType.EDIT, _caption="StepAtt", _default_val="5"),
+            UIElement(_type=UIElementType.EDIT, _caption="AniFile", _default_val="motion.avi"),
+            UIElement(_type=UIElementType.BUTTON, _caption="Animation", _default_val=self.Animation),
+            UIElement(_type=UIElementType.NEW_LINE),
+        ]
+        recon_subgrid, recon_dic = self.createGroupBox("Mesh up / Texture Overlay", recon_ele_list)
+        self.ui_dic_list.append(recon_dic)
+        recon_grid = QGridLayout()
+        recon_grid.addWidget(recon_subgrid, 0, 0)
+        recon_grid.setRowStretch(1, 1)
+        recon_tab = QWidget()
+        recon_tab.setLayout(recon_grid)
+
+        # ── tabs ───────────────────────────────────────────────
+        control_tab = QWidget()
+        control_tab.setLayout(self.mainGrid)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(control_tab, "Control")
+        self.tabs.addTab(recon_tab, "Reconstruction")
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.tabs)
+        self.setLayout(outer)
+
+        self.setWindowTitle("Basic Control")
+        self.resize(1000, 1000)
+        self.LoadPreset()
+
+        # odometry state
+        self.enc_val_reset()
+        self.reset_odometry()
+        self.update_odometry = False
+        self._prev_moving = False
+        self._streaming = False
+        self._click_cb       = None
+        self._dblclick_cb    = None
+        self._preset_cam_win = None
+
+        self.sequential_cmd_list = []
+
+        self.measure_timer = QTimer(self)
+        self.measure_timer.start(50)
+        self.measure_timer.timeout.connect(self.measure_timer_slot)
+
+        self.control_timer = QTimer(self)
+        self.control_timer.start(80)
+        self.control_timer.timeout.connect(self.control_timer_slot)
+
+        self.joystick = ThalamusJoystick()
+        self.old_hat = [0, 0]
+        self.tilting_servo = -999999
+        self.panning_servo = -999999
+        self.joystick_timer = QTimer(self)
+        self.joystick_timer.start(100)
+        self.joystick_timer.timeout.connect(self.joystick_timer_slot)
+
+        # Animation: 버튼 클릭 시에만 start()되는 타이머 (한 틱 = 한 스텝)
+        self._animation_timer = QTimer(self)
+        self._animation_timer.timeout.connect(self._animation_step)
+        self._ani_writer = None
+        self._ani_file   = None
+        self._ani_pos_x  = 0.0
+        self._ani_pos_z  = 0.0
+        self._ani_step_pos = 0.0
+        self._ani_att_y  = 0.0
+        self._ani_step_att = 0.0
+
+        # video_shot: RGB 영상(img.mp4) + depthmap 리스트(DepthMap.bin) 동시 녹화.
+        # 디렉터리는 언제나 같은 이름(~/ros_workplace/video_shot)이라 재녹화 시 덮어쓴다.
+        self._vid_dir        = os.path.expanduser('~/ros_workplace/video_shot')
+        self._vid_writer     = None
+        self._vid_depth_fp   = None
+        self._vid_frame_cnt  = 0
+        self._vid_rgb_size   = None   # (w, h)
+        self._vid_depth_size = None   # (w, h) - 리스트에 저장되는 depthmap 한 장 크기(고정)
+        self._vid_prev_rgb   = None
+        self._vid_fps        = 30.0
+        self._vid_timer = QTimer(self)
+        self._vid_timer.timeout.connect(self._vidrec_step)
+
+    def register_auto_callbacks(self, click_cb, dblclick_cb):
+        self._click_cb    = click_cb
+        self._dblclick_cb = dblclick_cb
+
+    def register_preset_window(self, w):
+        self._preset_cam_win = w
+
+    def focus_auto_window(self):
+        if self._preset_cam_win is not None:
+            self._preset_cam_win.hide()
+            self._preset_cam_win.show()
+
+    # ── odometry helpers ───────────────────────────────────────
+    def enc_val_reset(self):
+        self.enc_idx      = []
+        self.enc_dist1    = []
+        self.enc_dist2    = []
+        self.enc_spd1     = []
+        self.enc_spd2     = []
+        self.cam_yaw_list = []
+        self.cam_yaw_bias = None
+        self.cam_yaw_prev = None
+        self.cam_yaw_accum = 0.0
+        self.local_yaw    = 0
+        self.vio_yaw_list = []  # enc_idx와 길이 동기화
+
+    def vio_yaw_reset(self):
+        self.vio_yaw_list = []
+        self.vio_yaw_bias = None
+
+    def reset_odometry(self):
+        self.enc_val_reset()
+        self.vio_yaw_reset()
+        self.odom_x   = [0]
+        self.odom_y   = [0]
+        self.odom_yaw = [90]
+        self.setUIVal("Trajectory", [
+            np.asarray([0.0]), np.asarray([0.0]), np.asarray([90.0]), 0
+        ])
+
+    # ── streaming ──────────────────────────────────────────────
+    def open_streaming(self):
+        self._streaming_window = StreamingWindow()
+        if self._click_cb:
+            self._streaming_window.set_click_cb(self._click_cb)
+        if self._dblclick_cb:
+            self._streaming_window.set_dblclick_cb(self._dblclick_cb)
+        if self._preset_cam_win is not None:
+            self._streaming_window.set_esc_cb(self._preset_cam_win.cancel_tracking)
+        self._streaming_window.show()
+        self._streaming = True
+
+    def still_shot(self, save_dir=None):
+        rgb = self.ros_node.rgb_image
+        if rgb is None:
+            self.ros_node.get_logger().warn('still_shot: no rgb image available')
+            return None
+
+        # MinMaxDepth: "min:max" (mm) - depth_image 자체는 m 단위라 비교 전에 변환
+        min_max_str = self.get_ui_val("MinMaxDepth") or "600:6000"
+        try:
+            depth_min_mm, depth_max_mm = (float(v) for v in min_max_str.split(":"))
+        except Exception:
+            self.ros_node.get_logger().warn(
+                f"still_shot: MinMaxDepth 파싱 실패 '{min_max_str}', 기본값(600:6000) 사용")
+            depth_min_mm, depth_max_mm = 600.0, 6000.0
+        depth_min_m = depth_min_mm / 1000.0
+        depth_max_m = depth_max_mm / 1000.0
+
+        avg_cnt = max(int(self.get_ui_val("AvgCnt", float) or 10), 1)
+        min_valid_cnt = avg_cnt // 2  # 유효 샘플 수가 이 값 이하(=절반 이하)면 0으로 처리
+
+        depth_sum   = None
+        depth_count = None
+        prev_depth  = None
+        collected   = 0
+        max_wait_iters = avg_cnt * 20  # depth가 전혀 안 들어올 때 대비한 안전 타임아웃
+
+        for _ in range(max_wait_iters):
+            if collected >= avg_cnt:
+                break
+            d = self.ros_node.depth_image
+            if d is None or d is prev_depth:
+                time.sleep(0.02)
+                continue
+            prev_depth = d
+
+            if depth_sum is None:
+                depth_sum   = np.zeros(d.shape, dtype=np.float64)
+                depth_count = np.zeros(d.shape, dtype=np.int32)
+
+            valid = np.isfinite(d) & (d >= depth_min_m) & (d <= depth_max_m)
+            depth_sum[valid]   += d[valid]
+            depth_count[valid] += 1
+            collected += 1
+            time.sleep(0.02)
+
+        if collected < avg_cnt:
+            self.ros_node.get_logger().warn(
+                f'still_shot: depth 프레임 {collected}/{avg_cnt}개만 모음 (타임아웃)')
+
+        import os
+        from datetime import datetime
+        if not save_dir:  # 버튼 클릭 시 PyQt가 checked(bool)=False를 넘겨줄 수 있어 not으로 처리
+            save_dir = os.path.join(
+                os.path.expanduser('~/ros_workplace/still_shots'),
+                datetime.now().strftime('%Y%m%d_%H%M%S')
+            )
+        os.makedirs(save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
+
+        if depth_sum is not None:
+            depth_avg = np.zeros(depth_sum.shape, dtype=np.float32)
+            valid_mask = depth_count > min_valid_cnt
+            depth_avg[valid_mask] = (depth_sum[valid_mask] / depth_count[valid_mask]).astype(np.float32)
+            depth_avg *= 1000.0  # m -> mm (depth.bin은 mm 단위로 저장)
+            depth_avg.tofile(os.path.join(save_dir, 'depth.bin'))
+        else:
+            depth_avg = None
+            self.ros_node.get_logger().warn('still_shot: depth 프레임을 하나도 못 모아서 depth.bin은 저장하지 않음')
+
+        self.ros_node.get_logger().info(f'still_shot saved: {save_dir}')
+
+        # 저장한 것을 그대로 화면에 표시
+        cv2.imshow("Still Shot - RGB", rgb)
+        if depth_avg is not None:
+            d_vis = depth_avg.copy()
+            valid_d = d_vis[d_vis > 0]
+            if valid_d.size > 0:
+                mn, mx = np.percentile(valid_d, 1), np.percentile(valid_d, 99)
+                d_vis = np.clip(d_vis, mn, mx)
+                d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+            else:
+                d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+            cv2.imshow("Still Shot - Depth(avg)", cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+        cv2.waitKey(1)
+
+        return save_dir
+
+    # ── video_shot : RGB 영상 + depthmap 리스트 동시 녹화 ─────────
+    def _vid_path(self, name):
+        return os.path.join(self._vid_dir, name)
+
+    def vidrec_start(self, _checked=False):
+        if self._vid_writer is not None:
+            self.ros_node.get_logger().warn('vidrec_start: 이미 녹화 중')
+            return
+
+        rgb = self.ros_node.rgb_image
+        if rgb is None:
+            self.ros_node.get_logger().warn('vidrec_start: rgb 프레임이 아직 없음')
+            return
+
+        os.makedirs(self._vid_dir, exist_ok=True)
+        h, w = rgb.shape[:2]
+        self._vid_rgb_size = (w, h)
+
+        # depthmap 한 장 크기는 녹화 시작 시점에 고정한다(리스트 파일이 ragged 해지지 않도록).
+        depth0 = self.ros_node.depth_image
+        if depth0 is not None:
+            self._vid_depth_size = (depth0.shape[1], depth0.shape[0])
+        else:
+            self._vid_depth_size = (w, h)
+
+        writer = cv2.VideoWriter(
+            self._vid_path('img.mp4'), cv2.VideoWriter_fourcc(*'mp4v'),
+            self._vid_fps, (w, h))
+        if not writer.isOpened():
+            self.ros_node.get_logger().error(
+                f"vidrec_start: VideoWriter 열기 실패 ({self._vid_path('img.mp4')})")
+            return
+
+        self._vid_writer    = writer
+        self._vid_depth_fp  = open(self._vid_path('DepthMap.bin'), 'wb')
+        self._vid_frame_cnt = 0
+        self._vid_prev_rgb  = None
+        self._vid_timer.start(int(1000 / self._vid_fps))
+        self.ros_node.get_logger().info(f'vidrec_start: 녹화 시작 -> {self._vid_dir}')
+
+    def _vidrec_step(self):
+        if self._vid_writer is None:
+            return
+        rgb = self.ros_node.rgb_image
+        if rgb is None or rgb is self._vid_prev_rgb:
+            return  # 새 프레임이 아직 안 들어온 틱은 건너뛴다(중복 프레임 방지)
+        self._vid_prev_rgb = rgb
+
+        w, h = self._vid_rgb_size
+        if (rgb.shape[1], rgb.shape[0]) != (w, h):
+            rgb = cv2.resize(rgb, (w, h))
+        self._vid_writer.write(rgb)
+
+        # depthmap은 still_shot의 depth.bin과 같은 단위(mm) float32로 리스트에 append
+        dw, dh = self._vid_depth_size
+        depth = self.ros_node.depth_image
+        if depth is not None:
+            d = np.asarray(depth, dtype=np.float32) * 1000.0  # m -> mm
+            d[~np.isfinite(d)] = 0.0
+            if (d.shape[1], d.shape[0]) != (dw, dh):
+                d = cv2.resize(d, (dw, dh))
+            d = np.ascontiguousarray(d, dtype=np.float32)
+        else:
+            d = np.zeros((dh, dw), np.float32)
+        d.tofile(self._vid_depth_fp)
+        self._vid_frame_cnt += 1
+
+    def vidrec_stop(self, _checked=False):
+        if self._vid_writer is None:
+            self.ros_node.get_logger().warn('vidrec_stop: 녹화 중이 아님')
+            return
+        self._vid_timer.stop()
+        self._vid_writer.release()
+        self._vid_writer = None
+        if self._vid_depth_fp is not None:
+            self._vid_depth_fp.close()
+            self._vid_depth_fp = None
+
+        rw, rh = self._vid_rgb_size or (0, 0)
+        dw, dh = self._vid_depth_size or (0, 0)
+        with open(self._vid_path('meta.txt'), 'w') as f:
+            f.write(json.dumps({
+                'frames': self._vid_frame_cnt,
+                'rgb_w': rw, 'rgb_h': rh,
+                'depth_w': dw, 'depth_h': dh,
+                'depth_unit': 'mm', 'fps': self._vid_fps,
+            }) + '\n')
+        self.ros_node.get_logger().info(
+            f'vidrec_stop: {self._vid_frame_cnt} 프레임 저장 완료 -> {self._vid_dir}')
+
+    def get_vid(self, _checked=False):
+        idx = self.get_ui_val('frame_idx', int)
+        if idx is None or idx < 0:
+            idx = 0
+
+        video_path = self._vid_path('img.mp4')
+        depth_path = self._vid_path('DepthMap.bin')
+        meta_path  = self._vid_path('meta.txt')
+
+        if not os.path.isfile(video_path):
+            self.ros_node.get_logger().warn(f'get_vid: 영상 파일 없음 ({video_path})')
+            return
+
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            self.ros_node.get_logger().warn(
+                f'get_vid: 프레임 {idx} 읽기 실패 (총 {total}프레임)')
+            return
+        cv2.imshow('get_vid - RGB', frame)
+
+        # depthmap 리스트(DepthMap.bin)에서 idx번째 depthmap 한 장을 Thalamus 엔진으로 로드.
+        # LoadBinDepthMap의 마지막 int 인자가 리스트 내 프레임 인덱스.
+        dep_w = dep_h = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    m = json.loads(f.readline())
+                dep_w, dep_h = int(m['depth_w']), int(m['depth_h'])
+            except Exception:
+                dep_w = dep_h = None
+        if not dep_w or not dep_h:
+            dep_w, dep_h = self._vid_depth_size or (0, 0)
+
+        if os.path.isfile(depth_path) and dep_w and dep_h:
+            _init_thalamus()
+            Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+            Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+            ret = LoadBinDepthMapPnt(depth_path, dep_w, dep_h, 600, 6000,
+                                     Depth_Map.ctypes, Depth_Mask.ctypes, idx)
+            if ret != 0:
+                d_vis = Depth_Map.copy()
+                valid = d_vis[d_vis > 0]
+                if valid.size > 0:
+                    mn, mx = np.percentile(valid, 1), np.percentile(valid, 99)
+                    d_vis = np.clip(d_vis, mn, mx)
+                    d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+                else:
+                    d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+                cv2.imshow('get_vid - Depth', cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+            else:
+                self.ros_node.get_logger().warn(
+                    f'get_vid: LoadBinDepthMap 실패 (idx={idx}, {dep_w}x{dep_h})')
+        cv2.waitKey(1)
+        self.ros_node.get_logger().info(f'get_vid: frame {idx} 표시 (총 {total}프레임)')
+
+    def save_slice(self, _checked=False):
+        from datetime import datetime
+
+        idx = self.get_ui_val('frame_idx', int)
+        if idx is None or idx < 0:
+            idx = 0
+        avg_cnt = max(self.get_ui_val('vid_avgcnt', int) or 10, 1)
+        min_valid_cnt = avg_cnt // 2  # still_shot과 동일: 유효 샘플이 절반 이하면 0
+
+        video_path = self._vid_path('img.mp4')
+        depth_path = self._vid_path('DepthMap.bin')
+        meta_path  = self._vid_path('meta.txt')
+
+        if not os.path.isfile(video_path):
+            print(f'save_slice: 영상 파일 없음 ({video_path})')
+            return
+
+        # RGB: frame_idx 한 장
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, rgb = cap.read()
+        cap.release()
+        if not ok:
+            print(f'save_slice: 프레임 {idx} 읽기 실패 (총 {total}프레임)')
+            return
+
+        # depthmap 한 장 크기 (meta 우선)
+        dep_w = dep_h = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    m = json.loads(f.readline())
+                dep_w, dep_h = int(m['depth_w']), int(m['depth_h'])
+            except Exception:
+                dep_w = dep_h = None
+        if not dep_w or not dep_h:
+            dep_w, dep_h = self._vid_depth_size or (0, 0)
+
+        # MinMaxDepth "min:max" (mm) - still_shot과 동일
+        min_max_str = self.get_ui_val('MinMaxDepth') or '600:6000'
+        try:
+            depth_min_mm, depth_max_mm = (float(v) for v in min_max_str.split(':'))
+        except Exception:
+            depth_min_mm, depth_max_mm = 600.0, 6000.0
+
+        # depthmap 리스트에서 idx..idx+avg_cnt-1 을 픽셀별 평균
+        depth_avg = None
+        if os.path.isfile(depth_path) and dep_w and dep_h:
+            _init_thalamus()
+            depth_sum   = np.zeros((dep_h, dep_w), np.float64)
+            depth_count = np.zeros((dep_h, dep_w), np.int32)
+            collected = 0
+            for k in range(avg_cnt):
+                fi = idx + k
+                if fi >= total:
+                    break
+                Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+                Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+                if 0 == LoadBinDepthMapPnt(depth_path, dep_w, dep_h,
+                                           depth_min_mm, depth_max_mm,
+                                           Depth_Map.ctypes, Depth_Mask.ctypes, fi):
+                    continue
+                valid = (np.isfinite(Depth_Map)
+                         & (Depth_Map >= depth_min_mm) & (Depth_Map <= depth_max_mm))
+                depth_sum[valid]   += Depth_Map[valid]
+                depth_count[valid] += 1
+                collected += 1
+            if collected > 0:
+                depth_avg = np.zeros((dep_h, dep_w), np.float32)
+                mask = depth_count > min_valid_cnt
+                depth_avg[mask] = (depth_sum[mask] / depth_count[mask]).astype(np.float32)
+            else:
+                print('save_slice: depthmap을 하나도 못 읽음 -> depth.bin 저장 안 함')
+        else:
+            print(f'save_slice: depthmap 리스트 없음/크기 불명 ({depth_path})')
+
+        # 저장: still_shot과 같은 위치(~/ros_workplace/still_shots/<타임스탬프>/), 같은 형식
+        save_dir = os.path.join(
+            os.path.expanduser('~/ros_workplace/still_shots'),
+            datetime.now().strftime('%Y%m%d_%H%M%S'))
+        os.makedirs(save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
+        if depth_avg is not None:
+            depth_avg.tofile(os.path.join(save_dir, 'depth.bin'))  # float32, mm
+
+        print(f'save_slice: frame {idx} (+{avg_cnt}장 avg) 저장 -> {save_dir}')
+
+        # 미리보기 (still_shot과 동일한 표시 방식)
+        cv2.imshow('save_slice - RGB', rgb)
+        if depth_avg is not None:
+            d_vis = depth_avg.copy()
+            valid_d = d_vis[d_vis > 0]
+            if valid_d.size > 0:
+                mn, mx = np.percentile(valid_d, 1), np.percentile(valid_d, 99)
+                d_vis = np.clip(d_vis, mn, mx)
+                d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+            else:
+                d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+            cv2.imshow('save_slice - Depth(avg)', cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+        cv2.waitKey(1)
+
+    # ── 50 ms update timer ─────────────────────────────────────
+    def measure_timer_slot(self):
+        if self._streaming:
+            if self._preset_cam_win is not None:
+                self._preset_cam_win.update_marker()  # 마커 픽셀 위치 갱신 (update_rgb 전)
+            rgb = self.ros_node.rgb_image
+            depth = self.ros_node.depth_image
+            if rgb is not None:
+                self._streaming_window.update_rgb(rgb)
+            if depth is not None:
+                d = depth.copy()
+                d[~np.isfinite(d)] = 0
+                valid = d[d > 0]
+                if valid.size > 0:
+                    mn, mx = np.percentile(valid, 1), np.percentile(valid, 99)
+                    d = np.clip(d, mn, mx)
+                    d = ((d - mn) / (mx - mn) * 255).astype(np.uint8)
+                else:
+                    d = np.zeros_like(d, dtype=np.uint8)
+                self._streaming_window.update_depth(cv2.applyColorMap(d, cv2.COLORMAP_TURBO))
+
+        att = self.ros_node.attitude
+        if att is not None:
+            self.set_ui_val("camera_roll",  f"{att.x:.1f}")
+            self.set_ui_val("camera_pitch", f"{att.y:.1f}")
+            self.set_ui_val("camera_yaw",   f"{att.z:.1f}")
+
+        md = self.ros_node.motion_data
+        if md is None:
+            return
+        enc1, enc2, spd1, spd2, stat1, stat2 = md
+
+        self.set_ui_val("enc1",  str(enc1))
+        self.set_ui_val("enc2",  str(enc2))
+        self.set_ui_val("spd1",  str(spd1))
+        self.set_ui_val("spd2",  str(spd2))
+        self.set_ui_val("stat1", str(stat1))
+        self.set_ui_val("stat2", str(stat2))
+
+        is_moving = (stat1 != 0 and stat2 != 0)
+        if not is_moving:
+            self.enc_val_reset()
+            if self._prev_moving:
+                stop_vio()
+        else:
+            # enc 값이 갑자기 크게 감소하면 펌웨어 리셋으로 간주하고 초기화
+            if self.enc_dist1 and enc1 < self.enc_dist1[-1] - 1000:
+                print(f"[odom] enc 불연속 감지 ({self.enc_dist1[-1]} → {enc1}), enc_val_reset")
+                self.enc_val_reset()
+            self.enc_idx.append(0 if not self.enc_idx else self.enc_idx[-1] + 1)
+            self.enc_dist1.append(enc1)
+            self.enc_dist2.append(enc2)
+            self.enc_spd1.append(spd1)
+            self.enc_spd2.append(spd2)
+            att = self.ros_node.attitude
+            cam_yaw = att.z if att is not None else (self.cam_yaw_prev if self.cam_yaw_prev is not None else 0.0)
+            if self.cam_yaw_prev is not None:
+                delta_raw = cam_yaw - self.cam_yaw_prev
+                delta = (delta_raw + 180) % 360 - 180  # normalize to [-180, 180]
+                if abs(delta) <= 50:  # 50ms 내 50° 초과 = AHRS 글리치, 스킵
+                    self.cam_yaw_accum += delta
+            self.cam_yaw_prev = cam_yaw
+            self.cam_yaw_list.append(self.cam_yaw_accum)
+            vio_yaw_raw = get_last_vio_yaw()
+            if self.vio_yaw_bias is None:
+                self.vio_yaw_bias = vio_yaw_raw
+            self.vio_yaw_list.append(vio_yaw_raw - self.vio_yaw_bias)
+
+            def return_rated_minmax(_min, _max, _rate=1.1):
+                _ctr = (_min + _max) / 2
+                _min = (_min - _ctr) * _rate + _ctr
+                _max = (_max - _ctr) * _rate + _ctr
+                return _min, _max
+
+            x     = np.array(self.enc_idx)
+            _enc1 = np.array(self.enc_dist1)
+            _enc2 = np.array(self.enc_dist2)
+            l_enc_min, l_enc_max = return_rated_minmax(min([_enc1.min(), _enc2.min()]),
+                                                        max([_enc1.max(), _enc2.max()]))
+
+            _spd1 = np.array(self.enc_spd1)
+            _spd2 = np.array(self.enc_spd2)
+            l_spd_min, l_spd_max = return_rated_minmax(min([_spd1.min(), _spd2.min()]),
+                                                        max([_spd1.max(), _spd2.max()]))
+
+            self.setUIVal("Graph1D_Enc", [
+                (x, _enc1, ['l', l_enc_min, l_enc_max], "enc1(left)",  "r"),
+                (x, _enc2, ['l', l_enc_min, l_enc_max], "enc2(right)",  "g"),
+                (x, _spd1, ['r', l_spd_min, l_spd_max], "spd1(left)", "b"),
+                (x, _spd2, ['r', l_spd_min, l_spd_max], "spd2(right)", "m"),
+            ])
+
+            _dist    = (_enc1 + _enc2) / 2 / meter_per_enc
+            _yaw     = (_enc1 - _enc2) / rotate_pi_per_enc / 2 * 180
+            _cam_yaw = np.array(self.cam_yaw_list)
+
+            _neg_yaw = -_yaw
+            _vio_yaw = np.array(self.vio_yaw_list)
+            l_yaw_min = min([_neg_yaw.min(), _cam_yaw.min(), _vio_yaw.min()])
+            l_yaw_max = max([_neg_yaw.max(), _cam_yaw.max(), _vio_yaw.max()])
+
+            l_yaw_min, l_yaw_max = return_rated_minmax(l_yaw_min, l_yaw_max)
+
+            self.setUIVal("Graph1D_DistYaw", [
+                (x, _neg_yaw,  ['l', l_yaw_min, l_yaw_max], "odom_yaw", "r"),
+                (x, _cam_yaw,  ['l', l_yaw_min, l_yaw_max], "imu_yaw", "g"),
+                (x, _vio_yaw,  ['l', l_yaw_min, l_yaw_max], "vio_yaw", "b"),
+            ])
+            self.set_ui_val("odom_yaw", f"{self.odom_yaw[-1]:.1f}")
+
+            if self.update_odometry:
+                ds    = (_dist[-1] - _dist[-2]) if len(_dist) >= 2 else 0.0
+                d_yaw = (_yaw[-1]  - _yaw[-2])  if len(_yaw)  >= 2 else 0.0
+                yaw_1 = self.odom_yaw[-1] + d_yaw
+                self.local_yaw += d_yaw
+                theta = np.deg2rad(yaw_1)
+                self.odom_x.append(self.odom_x[-1]     + ds * np.cos(theta))
+                self.odom_y.append(self.odom_y[-1]     + ds * np.sin(theta))
+                self.odom_yaw.append(yaw_1)
+
+                tx = np.asarray(self.odom_x)
+                ty = np.asarray(self.odom_y)
+                ty_ = np.asarray(self.odom_yaw)
+                self.setUIVal("Trajectory", [tx, ty, ty_, len(tx) - 1])
+                self.set_ui_val("odometry_X",      f"{self.odom_x[-1]:.3f}")
+                self.set_ui_val("odometry_Y",      f"{self.odom_y[-1]:.3f}")
+                self.set_ui_val("odometry_Yaw",    f"{self.odom_yaw[-1]:.3f}")
+                self.set_ui_val("local_action_yaw", f"{int(self.local_yaw)}")
+                if self._preset_cam_win is not None:
+                    self._preset_cam_win.update_local(
+                        self.odom_x[-1], self.odom_y[-1], self.odom_yaw[-1])
+            else:
+                self.enc_val_reset()
+
+        self._prev_moving = is_moving
+
+    # ── serial send helpers ────────────────────────────────────
+    def _send(self, raw_str):
+        self.ros_node.send_serial(raw_str)
+
+    def SendStr(self):
+        self._send(self.get_ui_val("SendStr"))
+
+    def SetTilt(self):
+        angle = int(min(self.get_ui_val("TiltAngle", float) / 90 * 1000, 1000))
+        self.set_ui_val("SendStr", f"SV -1 {angle}")
+        self.SendStr()
+
+    def SetPanning(self):
+        pan = 1500.0 - self.get_ui_val("PanningAngle", float) / 135.0 * 1000.0
+        self.set_ui_val("SendStr", f"SV 1 {int(pan)}")
+        self.SendStr()
+
+    def MotCancel(self):
+        self.set_ui_val("SendStr", "EN -1 1")
+        self.SendStr()
+        self.enc_val_reset()
+        self.update_odometry = False
+        stop_vio()
+
+    def MoveFoward(self):
+        self.MotCancel()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("MOVE")
+        time.sleep(0.25)
+        spd  = self.getUIVal("MVSpd")[0]
+        dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
+        self.set_ui_val("SendStr", f"MV 1 {spd} -{dist}")
+        self.SendStr()
+        self.update_odometry = True
+
+    def MoveBackward(self):
+        self.MotCancel()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("MOVE")
+        time.sleep(0.25)
+        spd  = self.getUIVal("MVSpd")[0]
+        dist = int(self.get_ui_val("Distance", float) / 1000 * meter_per_enc)
+        self.set_ui_val("SendStr", f"MV 1 {spd} {dist}")
+        self.SendStr()
+        self.update_odometry = True
+
+    def RotateLeft(self):
+        self.MotCancel()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("ROT")
+        time.sleep(0.25)
+        spd  = self.getUIVal("RotSpd")[0]
+        dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)
+        self.set_ui_val("SendStr", f"RT 1 {spd} -{dist}")
+        self.SendStr()
+        self.update_odometry = True
+
+    def RotateRight(self):
+        self.MotCancel()
+        self.vio_yaw_reset()
+        set_vio_cmd_type("ROT")
+        time.sleep(0.25)
+        spd  = self.getUIVal("RotSpd")[0]
+        dist = int(self.get_ui_val("RotAngle", float) / 180 * rotate_pi_per_enc)
+        self.set_ui_val("SendStr", f"RT 1 {spd} {dist}")
+        self.SendStr()
+        self.update_odometry = True
+
+    # ── 80 ms control timer ────────────────────────────────────
+    def control_timer_slot(self):
+        mode = self.get_ui_val("CamTrackMode") or "None"
+
+        if mode == "fix_cam_rotation":
+            local_yaw  = self.get_ui_val("local_action_yaw", int) or 0
+            n_offset   = self.get_ui_val("N", int) or 0
+            target_pan = local_yaw + n_offset
+            if target_pan != (self.get_ui_val("PanningAngle", int) or 0):
+                self.set_ui_val("PanningAngle", f"{target_pan}")
+                self.SetPanning()
+
+        elif mode == "fix_on_target":
+            odom_x   = self.odom_x[-1]   if self.odom_x   else None
+            odom_y   = self.odom_y[-1]   if self.odom_y   else None
+            odom_yaw = self.odom_yaw[-1] if self.odom_yaw else None
+            if odom_x is None:
+                return
+            tgt_x = self.get_ui_val("TgtPosX", float) or 0.0
+            tgt_y = self.get_ui_val("TgtPosY", float) or 0.0
+            tgt_z = self.get_ui_val("TgtPosZ", float) or 0.0
+
+            dx = tgt_x - odom_y
+            dz = tgt_z - odom_x
+            world_yaw     = -np.degrees(np.arctan2(dx, dz))
+            panning_angle = int(world_yaw + (odom_yaw - 90))
+
+            h_dist = np.sqrt(dx*dx + dz*dz)
+            tilting_angle = 0.0 if h_dist < 1e-6 else -np.degrees(np.arctan2(tgt_y, h_dist))
+            tilt_servo = get_tilt_servo_angle(tilting_angle)
+
+            print(f"[fix_on_target] pan={panning_angle} tilt={tilt_servo}")
+            if abs(panning_angle - (self.get_ui_val("PanningAngle", int) or 0)) > 1:
+                self.set_ui_val("PanningAngle", f"{panning_angle}")
+                self.SetPanning()
+            elif abs(tilt_servo - (self.get_ui_val("TiltAngle", int) or 0)) > 1:
+                self.set_ui_val("TiltAngle", f"{tilt_servo}")
+                self.SetTilt()
+
+    # ── joystick ───────────────────────────────────────────────
+    def KeepGoing(self):
+        pass
+
+    def Stopping(self):
+        pass
+
+    def joystick_timer_slot(self):
+        hat, btn, axis = self.joystick.get_status()
+
+        if len(btn) > 0:
+            if btn[4] == 1 or btn[5] == 1:  # L1/R1: 모션 취소
+                self.MotCancel()
+
+            if btn[6] == 1:  # L2: 틸트 + 패닝
+                if len(axis) > 4:
+                    servo_tilt_angle = int(45 + axis[4] * 45)
+
+                    #+하드웨어 특성에 따른 수정 : 내가 가진 조이스틱이 오른쪽 아날로그가 최대 0.41밖에 안나옴
+                    raw_pan = axis[3]
+                    if raw_pan > 0:
+                        raw_pan = min(raw_pan / 0.41, 1.0)
+                    servo_panning_angle = int(raw_pan * 135)
+                    #-하드웨어 특성에 따른 수정
+
+                    if int(self.get_ui_val("TiltAngle", float) or 0) != servo_tilt_angle:
+                        self.set_ui_val("TiltAngle", str(servo_tilt_angle))
+                        self.SetTilt()
+                    elif int(self.get_ui_val("PanningAngle", float) or 0) != servo_panning_angle:
+                        self.set_ui_val("PanningAngle", str(servo_panning_angle))
+                        self.SetPanning()
+
+            #print("axis:", " ".join(f"{v:6.2f}" for v in axis))
+
+        # D-pad 전진 / 후진
+        if hat[1] == 1:
+            if self.old_hat[1] == hat[1]:
+                self.KeepGoing()
+            else:
+                self.MoveFoward()
+        elif hat[1] == -1:
+            if self.old_hat[1] == hat[1]:
+                self.KeepGoing()
+            else:
+                self.MoveBackward()
+        elif hat[1] == 0:
+            if self.old_hat[1] != hat[1]:
+                self.Stopping()
+
+        # D-pad 회전
+        if hat[0] == 1:
+            if self.old_hat[0] == hat[0]:
+                self.KeepGoing()
+            else:
+                self.RotateRight()
+        elif hat[0] == -1:
+            if self.old_hat[0] == hat[0]:
+                self.KeepGoing()
+            else:
+                self.RotateLeft()
+        elif hat[0] == 0:
+            if self.old_hat[0] != hat[0]:
+                self.Stopping()
+
+        # 버튼 3: 프리셋
+        if len(btn) > 3:
+            if btn[3] == 1:
+                self.set_ui_val("SendStr", "SV 1 1425")
+                self.SendStr()
+                time.sleep(0.3)
+                self.set_ui_val("SendStr", "SV -1 211")
+                self.SendStr()
+
+        self.old_hat = copy.deepcopy(hat)
+
+    # ── Reconstruction : Mesh up / Texture Overlay ─────────────
+    def _recon_workdir(self):
+        return os.path.expanduser(self.get_ui_val("WorkingDir") or "~/ros_workplace")
+
+    def _recon_path(self, key):
+        p = os.path.expanduser(self.get_ui_val(key) or "")
+        if p and not os.path.isabs(p):
+            p = os.path.join(self._recon_workdir(), p)
+        return p
+
+    def ReconEngineStart(self):
+        workdir = self._recon_workdir()
+        if os.path.isdir(workdir):
+            os.chdir(workdir)
+            print(f"ReconEngineStart: cwd -> {workdir}")
+        else:
+            print(f"ReconEngineStart: WorkingDir 없음 ({workdir}), 현재 cwd 사용 {os.getcwd()}")
+
+        asm = (self.get_ui_val("ReconScriptFile") or "ScriptFreeModel.txt").encode("UTF-8")
+        win_text = (self.get_ui_val("ReconEngineName") or "Thalamus Reconstruction").encode("UTF-8")
+
+        if not LoadThalamusInterface():
+            print("ReconEngineStart: LoadThalamusInterface FAILED")
+            return
+
+        err = InitEngine(asm, 1280, 720, 0)
+        if err != 0:
+            msg = ""
+            if err & 1:
+                msg += "env.txt "
+            if err & 2:
+                msg += "script"
+            print(f"ReconEngineStart: InitEngine error {err} ({msg})")
+
+        StartExt3DEngine(asm, win_text)
+        _auto_control._thalamus_ready = True  # 이후 _init_thalamus() 재초기화 방지
+        print("ReconEngineStart: engine started")
+
+    def ReconSetPosAtt(self):
+        _init_thalamus()
+        px = self.get_ui_val("PosX", float) or 0.0
+        py = self.get_ui_val("PosY", float) or 0.0
+        pz = self.get_ui_val("PosZ", float) or 0.0
+        ax = self.get_ui_val("AttX", float) or 0.0
+        ay = self.get_ui_val("AttY", float) or 0.0
+        az = self.get_ui_val("AttZ", float) or 0.0
+
+        SetGlobalAttitude(ax, ay, az)
+        SetGlobalPosition(px, py, pz)
+        InitializeRenderFacet(-1, -1)
+
+    def ObjSetPosAtt(self):
+        _init_thalamus()
+        obj_id = self.get_ui_val("ObjID", int) or 0
+        px = self.get_ui_val("ObjPosX", float) or 0.0
+        py = self.get_ui_val("ObjPosY", float) or 0.0
+        pz = self.get_ui_val("ObjPosZ", float) or 0.0
+        ax = self.get_ui_val("ObjAttX", float) or 0.0
+        ay = self.get_ui_val("ObjAttY", float) or 0.0
+        az = self.get_ui_val("ObjAttZ", float) or 0.0
+
+        ret = SetObjectContextPosAtt(obj_id, px, py, pz, ax, ay, az)
+        if not ret:
+            print(f"ObjSetPosAtt: 실패 (ObjID={obj_id} - 존재하지 않거나 PUSH 구조가 안 맞음)")
+        InitializeRenderFacet(-1, -1)
+
+    def ReconBirdView(self):
+        for src, dst in (("Bird_PosX", "PosX"), ("Bird_PosY", "PosY"), ("Bird_PosZ", "PosZ"),
+                         ("Bird_AttX", "AttX"), ("Bird_AttY", "AttY"), ("Bird_AttZ", "AttZ")):
+            self.set_ui_val(dst, self.get_ui_val(src) or "0")
+        self.ReconSetPosAtt()
+
+    def _recon_view_param(self):
+        dim_w  = self.get_ui_val("ReconWidth",  int) or 300
+        dim_h  = self.get_ui_val("ReconHeight", int) or 300
+        obj_id = self.get_ui_val("ReconObjID",  int)
+        return (
+            self.get_ui_val("ReconSrcPosX",   int) or 0,
+            self.get_ui_val("ReconSrcPosY",   int) or 0,
+            self.get_ui_val("ReconSrcWidth",  int) or 1280,
+            self.get_ui_val("ReconSrcHeight", int) or 720,
+            dim_w,
+            dim_h,
+            obj_id if obj_id is not None else -1,
+        )
+
+    def ReconMeshUp(self):
+        _init_thalamus()
+        dep_w    = self.get_ui_val("DepthWidth",        int) or 256
+        dep_h    = self.get_ui_val("Deptheight",        int) or 256
+        dep_inv  = self.get_ui_val("ReconMeshUpInv",    int) or 0
+        mesh_typ = self.get_ui_val("ReconFreeModelNum", int) or 0
+        depth_bin = self._recon_path("ReconDepthBin")
+
+        if not os.path.isfile(depth_bin):
+            print(f"MeshUp: depth 파일 없음 ({depth_bin})")
+            return
+        n_bytes  = os.path.getsize(depth_bin)
+        exp_side = int(round((n_bytes / 4) ** 0.5))
+        if n_bytes != dep_w * dep_h * 4:
+            print(f"MeshUp: 크기 불일치 - 파일 {n_bytes}B (float32 {n_bytes // 4}개"
+                  f"{f', {exp_side}x{exp_side}' if exp_side * exp_side * 4 == n_bytes else ''})"
+                  f" vs DepthWidth*Deptheight={dep_w}x{dep_h}={dep_w * dep_h}. "
+                  f"DepthWidth/Deptheight를 파일에 맞춰 조정하세요.")
+            return
+
+        Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+        Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+
+        if 0 != LoadBinDepthMapPnt(depth_bin, dep_w, dep_h, 600, 6000,
+                                   Depth_Map.ctypes, Depth_Mask.ctypes):
+            Depth_Map = cv2.normalize(Depth_Map, None, alpha=0, beta=1.0,
+                                      norm_type=cv2.NORM_MINMAX)
+            cv2.imshow("Depth Map", Depth_Map)
+            cv2.waitKey(1)
+            ret = ObjMeshUp(dep_w, dep_h, mesh_typ, dep_inv)
+            print("ObjMeshUp:", ret)
+            InitializeRenderFacet(-1, -1)
+        else:
+            print(f"MeshUp: depth load error ({depth_bin})")
+
+    def ReconTexOverlay(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        tex_path = self._recon_path("ReconColorImg")
+
+        Texture = cv2.imread(tex_path)
+        if Texture is None:
+            print(f"Texture Overlay: cannot read image ({tex_path})")
+            return
+        Texture = np.ascontiguousarray(Texture)
+        tex_h, tex_w = Texture.shape[:2]
+        cv2.imshow("Texture Src", Texture)
+        cv2.waitKey(1)
+
+        _, _, src_w, src_h, _, _, _ = self._recon_view_param()
+        TexureOveray(thread, Texture.ctypes, tex_w, tex_h, src_w, src_h)
+
+    def ReconTexInt(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        TextureInterpolation(thread)
+        print("Texture Interpolation")
+
+    def ReconTexView(self):
+        _init_thalamus()
+        thread = self.get_ui_val("ReconThread", int) or 12
+        src_x, src_y, src_w, src_h, dest_w, dest_h, obj_id = self._recon_view_param()
+
+        TextuedView = np.zeros((dest_h, dest_w, 3), np.uint8)
+        getTextureImg(thread, TextuedView.ctypes, src_x, src_y, src_w, src_h, dest_w, dest_h, obj_id)
+        cv2.imshow("Texture View", TextuedView)
+        cv2.waitKey(1)
+        return TextuedView
+
+    # ── Animation : ObjPosZ/ObjAttY를 스텝만큼씩 움직이며 TextureView 프레임을 avi로 저장 ──
+    def _consume_ani_step(self, remaining, step):
+        # remaining(목표까지 남은 양)을 0 쪽으로 |step|만큼 줄이고, remaining과 같은
+        # 부호로 실제 적용해야 할 델타를 돌려준다. (remaining=-500, step=10 -> delta=-10, remaining=-490)
+        step = abs(step)
+        if step == 0.0 or remaining == 0.0:
+            return remaining, 0.0
+        mag = min(step, abs(remaining))
+        delta = mag if remaining > 0 else -mag
+        return remaining - delta, delta
+
+    def Animation(self):
+        if self._animation_timer.isActive():
+            print("Animation: 이미 실행 중")
+            return
+
+        ani_pos_x = self.get_ui_val("AniPosX", float) or 0.0
+        ani_pos_z = self.get_ui_val("AniPosZ", float) or 0.0
+        step_pos  = self.get_ui_val("StepPos", float) or 0.0
+        ani_att_y = self.get_ui_val("AniAttY", float) or 0.0
+        step_att  = self.get_ui_val("StepAtt", float) or 0.0
+
+        if (ani_pos_x != 0.0 or ani_pos_z != 0.0) and step_pos == 0.0:
+            print("Animation: StepPos가 0이라 AniPosX/AniPosZ를 소진할 수 없음")
+            return
+        if ani_att_y != 0.0 and step_att == 0.0:
+            print("Animation: StepAtt가 0이라 AniAttY를 소진할 수 없음")
+            return
+
+        self._ani_pos_x    = ani_pos_x
+        self._ani_pos_z    = ani_pos_z
+        self._ani_step_pos = step_pos
+        self._ani_att_y    = ani_att_y
+        self._ani_step_att = step_att
+        self._ani_file     = self._recon_path("AniFile")
+        self._ani_writer   = None
+
+        self._animation_timer.start(50)  # 한 틱(50ms)마다 한 스텝씩 진행, UI/타 타이머와 공존
+
+    def _animation_finish(self):
+        self._animation_timer.stop()
+        if self._ani_writer is not None:
+            self._ani_writer.release()
+            self._ani_writer = None
+            print(f"Animation: 저장 완료 ({self._ani_file})")
+
+    def _animation_step(self):
+        if self._ani_pos_x == 0.0 and self._ani_pos_z == 0.0 and self._ani_att_y == 0.0:
+            self._animation_finish()
+            return
+
+        self._ani_pos_x, delta_pos_x = self._consume_ani_step(self._ani_pos_x, self._ani_step_pos)
+        if delta_pos_x != 0.0:
+            obj_pos_x = (self.get_ui_val("ObjPosX", float) or 0.0) + delta_pos_x
+            self.set_ui_val("ObjPosX", f"{obj_pos_x:g}")
+        self.set_ui_val("AniPosX", f"{self._ani_pos_x:g}")
+
+        self._ani_pos_z, delta_pos = self._consume_ani_step(self._ani_pos_z, self._ani_step_pos)
+        if delta_pos != 0.0:
+            obj_pos_z = (self.get_ui_val("ObjPosZ", float) or 0.0) + delta_pos
+            self.set_ui_val("ObjPosZ", f"{obj_pos_z:g}")
+        self.set_ui_val("AniPosZ", f"{self._ani_pos_z:g}")
+
+        self._ani_att_y, delta_att = self._consume_ani_step(self._ani_att_y, self._ani_step_att)
+        if delta_att != 0.0:
+            obj_att_y = (self.get_ui_val("ObjAttY", float) or 0.0) + delta_att
+            self.set_ui_val("ObjAttY", f"{obj_att_y:g}")
+        self.set_ui_val("AniAttY", f"{self._ani_att_y:g}")
+
+        self.ObjSetPosAtt()
+        frame = self.ReconTexView()
+        if frame is None:
+            return
+
+        if self._ani_writer is None:
+            h, w = frame.shape[:2]
+            self._ani_writer = cv2.VideoWriter(self._ani_file, cv2.VideoWriter_fourcc(*"XVID"), 15.0, (w, h))
+            if not self._ani_writer.isOpened():
+                print(f"Animation: VideoWriter 열기 실패 ({self._ani_file})")
+                self._ani_writer = None
+        if self._ani_writer is not None:
+            self._ani_writer.write(frame)
+
+    def quit_app(self):
+        self.joystick_timer.stop()
+        self.control_timer.stop()
+        self.measure_timer.stop()
+        if self._animation_timer.isActive():
+            self._animation_finish()  # 진행 중인 avi가 있으면 release해서 파일 깨지지 않게 마무리
+        if self._vid_writer is not None:
+            self.vidrec_stop()  # 녹화 중이면 마무리(파일/메타 정상 저장)
+        cv2.destroyAllWindows()
+        QApplication.quit()
+
+        # Engine Start로 띄운 "Thalamus Reconstruction" 창(Simul3DStart)은
+        # non-daemon 스레드에서 자체 GLUT 루프로 돌고, 이를 닫는 API가 없어서
+        # Qt만 종료하면 그 스레드가 프로세스 종료를 막아 창이 안 꺼진다.
+        # 남길 정리를 마친 뒤 프로세스를 통째로 강제 종료해서 같이 닫는다.
+        try:
+            self.ros_node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+def main(args=None):
+    _init_thalamus()
+    rclpy.init(args=args)
+    ros_node = UIControllerNode()
+
+    spin_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
+    spin_thread.start()
+
+    app = QApplication(sys.argv)
+    window = Window(ros_node)
+    preset_cam_window = PresetCamWindow(window)
+    window.register_preset_window(preset_cam_window)
+    window.register_auto_callbacks(
+        preset_cam_window._on_image_click,
+        preset_cam_window.set_clicked_pos,
+    )
+    window.show()
+    preset_cam_window.show()
+    ret = app.exec_()
+
+    ros_node.destroy_node()
+    rclpy.shutdown()
+    sys.exit(ret)
