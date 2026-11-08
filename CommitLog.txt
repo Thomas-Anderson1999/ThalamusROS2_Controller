@@ -14,3 +14,9 @@
 - get_vid: frame_idx 위치의 프레임과 depth 로드
 - save_slice: vid_avgcnt 프레임 depth 평균을 still_shots에 저장
 
+커밋 제목: [ThalamusROS2_Controller][2026-11-08] CNN 가중치(.pt) git 추적 제외
+왜: person_best.pt(52MB), light_best.pt(6.3MB)가 저장소를 키워서 기록에서 완전히 제거함 (filter-branch로 origin/main 이후 기록 재작성)
+무엇을:
+- cnn_weight/*.pt를 .gitignore에 추가
+- 가중치는 별도로 받아서 camera_ws/src/camera_pub/camera_pub/cnn_weight/에 넣어야 AutoControl.py가 동작함
+

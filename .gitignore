@@ -16,3 +16,6 @@ video_shot/
 still_shots/
 tmp_local_view/
 memo.txt
+
+# CNN 가중치 (용량 문제로 git 기록에서 제거, 별도 배포)
+camera_ws/src/camera_pub/camera_pub/cnn_weight/*.pt
