@@ -7,3 +7,10 @@
 - .gitignore에 Dataset/, video_shot/, still_shots/, tmp_local_view/, memo.txt 추가
 - 추적되던 __pycache__/*.pyc 인덱스에서 제거
 
+커밋 제목: [ThalamusROS2_Controller][2026-11-08] ui_controller 영상+depth 동시녹화(video_shot) 기능 추가
+왜: RGB 영상과 depthmap을 프레임 단위로 같이 기록해 두고, 나중에 특정 프레임을 꺼내 재구성/분석에 쓰기 위해
+무엇을:
+- ui_controller.py에 vidrec_start/vidrec_stop 버튼: ~/ros_workplace/video_shot에 RGB 영상 + DepthMap.bin + meta.txt 동시 녹화
+- get_vid: frame_idx 위치의 프레임과 depth 로드
+- save_slice: vid_avgcnt 프레임 depth 평균을 still_shots에 저장
+

@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import time
 import copy
 import threading
@@ -148,6 +149,13 @@ class Window(QWidget, UIBase):
             UIElement(_type=UIElementType.BUTTON, _caption="still_shot",      _default_val=self.still_shot),
 
             UIElement(_type=UIElementType.BUTTON, _caption="reset_odometry",  _default_val=self.reset_odometry),
+            UIElement(_type=UIElementType.NEW_LINE),
+            UIElement(_type=UIElementType.BUTTON, _caption="vidrec_start",    _default_val=self.vidrec_start),
+            UIElement(_type=UIElementType.BUTTON, _caption="vidrec_stop",     _default_val=self.vidrec_stop),
+            UIElement(_type=UIElementType.EDIT,   _caption="frame_idx",       _default_val="0"),
+            UIElement(_type=UIElementType.BUTTON, _caption="get_vid",         _default_val=self.get_vid),
+            UIElement(_type=UIElementType.EDIT,   _caption="vid_avgcnt",      _default_val="10"),
+            UIElement(_type=UIElementType.BUTTON, _caption="save_slice",      _default_val=self.save_slice),
             UIElement(_type=UIElementType.NEW_LINE),
             UIElement(_type=UIElementType.EDIT, _caption="camera_roll",  _default_val="0"),
             UIElement(_type=UIElementType.EDIT, _caption="camera_pitch", _default_val="0"),
@@ -311,6 +319,19 @@ class Window(QWidget, UIBase):
         self._ani_att_y  = 0.0
         self._ani_step_att = 0.0
 
+        # video_shot: RGB 영상(img.mp4) + depthmap 리스트(DepthMap.bin) 동시 녹화.
+        # 디렉터리는 언제나 같은 이름(~/ros_workplace/video_shot)이라 재녹화 시 덮어쓴다.
+        self._vid_dir        = os.path.expanduser('~/ros_workplace/video_shot')
+        self._vid_writer     = None
+        self._vid_depth_fp   = None
+        self._vid_frame_cnt  = 0
+        self._vid_rgb_size   = None   # (w, h)
+        self._vid_depth_size = None   # (w, h) - 리스트에 저장되는 depthmap 한 장 크기(고정)
+        self._vid_prev_rgb   = None
+        self._vid_fps        = 30.0
+        self._vid_timer = QTimer(self)
+        self._vid_timer.timeout.connect(self._vidrec_step)
+
     def register_auto_callbacks(self, click_cb, dblclick_cb):
         self._click_cb    = click_cb
         self._dblclick_cb = dblclick_cb
@@ -449,6 +470,257 @@ class Window(QWidget, UIBase):
         cv2.waitKey(1)
 
         return save_dir
+
+    # ── video_shot : RGB 영상 + depthmap 리스트 동시 녹화 ─────────
+    def _vid_path(self, name):
+        return os.path.join(self._vid_dir, name)
+
+    def vidrec_start(self, _checked=False):
+        if self._vid_writer is not None:
+            self.ros_node.get_logger().warn('vidrec_start: 이미 녹화 중')
+            return
+
+        rgb = self.ros_node.rgb_image
+        if rgb is None:
+            self.ros_node.get_logger().warn('vidrec_start: rgb 프레임이 아직 없음')
+            return
+
+        os.makedirs(self._vid_dir, exist_ok=True)
+        h, w = rgb.shape[:2]
+        self._vid_rgb_size = (w, h)
+
+        # depthmap 한 장 크기는 녹화 시작 시점에 고정한다(리스트 파일이 ragged 해지지 않도록).
+        depth0 = self.ros_node.depth_image
+        if depth0 is not None:
+            self._vid_depth_size = (depth0.shape[1], depth0.shape[0])
+        else:
+            self._vid_depth_size = (w, h)
+
+        writer = cv2.VideoWriter(
+            self._vid_path('img.mp4'), cv2.VideoWriter_fourcc(*'mp4v'),
+            self._vid_fps, (w, h))
+        if not writer.isOpened():
+            self.ros_node.get_logger().error(
+                f"vidrec_start: VideoWriter 열기 실패 ({self._vid_path('img.mp4')})")
+            return
+
+        self._vid_writer    = writer
+        self._vid_depth_fp  = open(self._vid_path('DepthMap.bin'), 'wb')
+        self._vid_frame_cnt = 0
+        self._vid_prev_rgb  = None
+        self._vid_timer.start(int(1000 / self._vid_fps))
+        self.ros_node.get_logger().info(f'vidrec_start: 녹화 시작 -> {self._vid_dir}')
+
+    def _vidrec_step(self):
+        if self._vid_writer is None:
+            return
+        rgb = self.ros_node.rgb_image
+        if rgb is None or rgb is self._vid_prev_rgb:
+            return  # 새 프레임이 아직 안 들어온 틱은 건너뛴다(중복 프레임 방지)
+        self._vid_prev_rgb = rgb
+
+        w, h = self._vid_rgb_size
+        if (rgb.shape[1], rgb.shape[0]) != (w, h):
+            rgb = cv2.resize(rgb, (w, h))
+        self._vid_writer.write(rgb)
+
+        # depthmap은 still_shot의 depth.bin과 같은 단위(mm) float32로 리스트에 append
+        dw, dh = self._vid_depth_size
+        depth = self.ros_node.depth_image
+        if depth is not None:
+            d = np.asarray(depth, dtype=np.float32) * 1000.0  # m -> mm
+            d[~np.isfinite(d)] = 0.0
+            if (d.shape[1], d.shape[0]) != (dw, dh):
+                d = cv2.resize(d, (dw, dh))
+            d = np.ascontiguousarray(d, dtype=np.float32)
+        else:
+            d = np.zeros((dh, dw), np.float32)
+        d.tofile(self._vid_depth_fp)
+        self._vid_frame_cnt += 1
+
+    def vidrec_stop(self, _checked=False):
+        if self._vid_writer is None:
+            self.ros_node.get_logger().warn('vidrec_stop: 녹화 중이 아님')
+            return
+        self._vid_timer.stop()
+        self._vid_writer.release()
+        self._vid_writer = None
+        if self._vid_depth_fp is not None:
+            self._vid_depth_fp.close()
+            self._vid_depth_fp = None
+
+        rw, rh = self._vid_rgb_size or (0, 0)
+        dw, dh = self._vid_depth_size or (0, 0)
+        with open(self._vid_path('meta.txt'), 'w') as f:
+            f.write(json.dumps({
+                'frames': self._vid_frame_cnt,
+                'rgb_w': rw, 'rgb_h': rh,
+                'depth_w': dw, 'depth_h': dh,
+                'depth_unit': 'mm', 'fps': self._vid_fps,
+            }) + '\n')
+        self.ros_node.get_logger().info(
+            f'vidrec_stop: {self._vid_frame_cnt} 프레임 저장 완료 -> {self._vid_dir}')
+
+    def get_vid(self, _checked=False):
+        idx = self.get_ui_val('frame_idx', int)
+        if idx is None or idx < 0:
+            idx = 0
+
+        video_path = self._vid_path('img.mp4')
+        depth_path = self._vid_path('DepthMap.bin')
+        meta_path  = self._vid_path('meta.txt')
+
+        if not os.path.isfile(video_path):
+            self.ros_node.get_logger().warn(f'get_vid: 영상 파일 없음 ({video_path})')
+            return
+
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            self.ros_node.get_logger().warn(
+                f'get_vid: 프레임 {idx} 읽기 실패 (총 {total}프레임)')
+            return
+        cv2.imshow('get_vid - RGB', frame)
+
+        # depthmap 리스트(DepthMap.bin)에서 idx번째 depthmap 한 장을 Thalamus 엔진으로 로드.
+        # LoadBinDepthMap의 마지막 int 인자가 리스트 내 프레임 인덱스.
+        dep_w = dep_h = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    m = json.loads(f.readline())
+                dep_w, dep_h = int(m['depth_w']), int(m['depth_h'])
+            except Exception:
+                dep_w = dep_h = None
+        if not dep_w or not dep_h:
+            dep_w, dep_h = self._vid_depth_size or (0, 0)
+
+        if os.path.isfile(depth_path) and dep_w and dep_h:
+            _init_thalamus()
+            Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+            Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+            ret = LoadBinDepthMapPnt(depth_path, dep_w, dep_h, 600, 6000,
+                                     Depth_Map.ctypes, Depth_Mask.ctypes, idx)
+            if ret != 0:
+                d_vis = Depth_Map.copy()
+                valid = d_vis[d_vis > 0]
+                if valid.size > 0:
+                    mn, mx = np.percentile(valid, 1), np.percentile(valid, 99)
+                    d_vis = np.clip(d_vis, mn, mx)
+                    d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+                else:
+                    d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+                cv2.imshow('get_vid - Depth', cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+            else:
+                self.ros_node.get_logger().warn(
+                    f'get_vid: LoadBinDepthMap 실패 (idx={idx}, {dep_w}x{dep_h})')
+        cv2.waitKey(1)
+        self.ros_node.get_logger().info(f'get_vid: frame {idx} 표시 (총 {total}프레임)')
+
+    def save_slice(self, _checked=False):
+        from datetime import datetime
+
+        idx = self.get_ui_val('frame_idx', int)
+        if idx is None or idx < 0:
+            idx = 0
+        avg_cnt = max(self.get_ui_val('vid_avgcnt', int) or 10, 1)
+        min_valid_cnt = avg_cnt // 2  # still_shot과 동일: 유효 샘플이 절반 이하면 0
+
+        video_path = self._vid_path('img.mp4')
+        depth_path = self._vid_path('DepthMap.bin')
+        meta_path  = self._vid_path('meta.txt')
+
+        if not os.path.isfile(video_path):
+            print(f'save_slice: 영상 파일 없음 ({video_path})')
+            return
+
+        # RGB: frame_idx 한 장
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, rgb = cap.read()
+        cap.release()
+        if not ok:
+            print(f'save_slice: 프레임 {idx} 읽기 실패 (총 {total}프레임)')
+            return
+
+        # depthmap 한 장 크기 (meta 우선)
+        dep_w = dep_h = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    m = json.loads(f.readline())
+                dep_w, dep_h = int(m['depth_w']), int(m['depth_h'])
+            except Exception:
+                dep_w = dep_h = None
+        if not dep_w or not dep_h:
+            dep_w, dep_h = self._vid_depth_size or (0, 0)
+
+        # MinMaxDepth "min:max" (mm) - still_shot과 동일
+        min_max_str = self.get_ui_val('MinMaxDepth') or '600:6000'
+        try:
+            depth_min_mm, depth_max_mm = (float(v) for v in min_max_str.split(':'))
+        except Exception:
+            depth_min_mm, depth_max_mm = 600.0, 6000.0
+
+        # depthmap 리스트에서 idx..idx+avg_cnt-1 을 픽셀별 평균
+        depth_avg = None
+        if os.path.isfile(depth_path) and dep_w and dep_h:
+            _init_thalamus()
+            depth_sum   = np.zeros((dep_h, dep_w), np.float64)
+            depth_count = np.zeros((dep_h, dep_w), np.int32)
+            collected = 0
+            for k in range(avg_cnt):
+                fi = idx + k
+                if fi >= total:
+                    break
+                Depth_Map  = np.zeros((dep_h, dep_w), np.float32)
+                Depth_Mask = np.zeros((dep_h, dep_w, 3), np.uint8)
+                if 0 == LoadBinDepthMapPnt(depth_path, dep_w, dep_h,
+                                           depth_min_mm, depth_max_mm,
+                                           Depth_Map.ctypes, Depth_Mask.ctypes, fi):
+                    continue
+                valid = (np.isfinite(Depth_Map)
+                         & (Depth_Map >= depth_min_mm) & (Depth_Map <= depth_max_mm))
+                depth_sum[valid]   += Depth_Map[valid]
+                depth_count[valid] += 1
+                collected += 1
+            if collected > 0:
+                depth_avg = np.zeros((dep_h, dep_w), np.float32)
+                mask = depth_count > min_valid_cnt
+                depth_avg[mask] = (depth_sum[mask] / depth_count[mask]).astype(np.float32)
+            else:
+                print('save_slice: depthmap을 하나도 못 읽음 -> depth.bin 저장 안 함')
+        else:
+            print(f'save_slice: depthmap 리스트 없음/크기 불명 ({depth_path})')
+
+        # 저장: still_shot과 같은 위치(~/ros_workplace/still_shots/<타임스탬프>/), 같은 형식
+        save_dir = os.path.join(
+            os.path.expanduser('~/ros_workplace/still_shots'),
+            datetime.now().strftime('%Y%m%d_%H%M%S'))
+        os.makedirs(save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(save_dir, 'img.png'), rgb)
+        if depth_avg is not None:
+            depth_avg.tofile(os.path.join(save_dir, 'depth.bin'))  # float32, mm
+
+        print(f'save_slice: frame {idx} (+{avg_cnt}장 avg) 저장 -> {save_dir}')
+
+        # 미리보기 (still_shot과 동일한 표시 방식)
+        cv2.imshow('save_slice - RGB', rgb)
+        if depth_avg is not None:
+            d_vis = depth_avg.copy()
+            valid_d = d_vis[d_vis > 0]
+            if valid_d.size > 0:
+                mn, mx = np.percentile(valid_d, 1), np.percentile(valid_d, 99)
+                d_vis = np.clip(d_vis, mn, mx)
+                d_vis = ((d_vis - mn) / (mx - mn) * 255).astype(np.uint8)
+            else:
+                d_vis = np.zeros_like(d_vis, dtype=np.uint8)
+            cv2.imshow('save_slice - Depth(avg)', cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO))
+        cv2.waitKey(1)
 
     # ── 50 ms update timer ─────────────────────────────────────
     def measure_timer_slot(self):
@@ -1012,6 +1284,8 @@ class Window(QWidget, UIBase):
         self.measure_timer.stop()
         if self._animation_timer.isActive():
             self._animation_finish()  # 진행 중인 avi가 있으면 release해서 파일 깨지지 않게 마무리
+        if self._vid_writer is not None:
+            self.vidrec_stop()  # 녹화 중이면 마무리(파일/메타 정상 저장)
         cv2.destroyAllWindows()
         QApplication.quit()
 
